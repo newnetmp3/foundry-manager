@@ -90,3 +90,9 @@ never passed to them.
 - The [Foundry VTT Players](https://github.com/newnetmp3/roll20embetterment/tree/main/kde-widget)
   KDE widget can watch each server: add a copy per server, with its own
   status address.
+
+## Desktop widget
+
+`kde-widget/` has a KDE Plasma 6 widget, **Foundry VTT Players**, that shows
+how many people are connected to a server. See
+[kde-widget/README.md](kde-widget/README.md).
