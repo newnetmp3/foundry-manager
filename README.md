@@ -50,12 +50,26 @@ Update later with `git -C ~/local-git/foundry-manager pull`.
 
 ## First run: Settings
 
-- **Foundry runs as user**: the user pm2 runs Foundry as (`komosatuo`).
-- **Existing server address**: `komosatuo.skotic.com`; new subdomains point
-  at it (CNAME), and the new nginx site goes next to its nginx file.
-- **Cloudflare zone**: `skotic.com`.
+The first time it starts, the tool asks which system user runs Foundry. It
+suggests users it finds already running Foundry or pm2, so usually you just
+confirm. You can also set it from the command line (saved for next time):
+
+```bash
+python3 ~/local-git/foundry-manager/foundry_manager.py --user foundry
+```
+
+Everything here can be changed later under **Settings**:
+
+- **Foundry runs as user**: the user pm2 runs Foundry as (for example
+  `foundry`). New servers are installed in that user's home folder.
+- **Existing server address**: for example `play.example.com`. Filled in from
+  your running server's `options.json` when it has one. New subdomains point at
+  it (CNAME), and the new nginx site goes next to its nginx file. Leave it
+  empty if you don't have one yet; DNS records then aren't created for you.
+- **Cloudflare zone**: the domain in Cloudflare, for example `example.com`
+  (worked out from the address).
 - **Cloudflare API token**: dash.cloudflare.com → My Profile → API Tokens →
-  Create Token → **Edit zone DNS**, for the zone `skotic.com`. Stored in
+  Create Token → **Edit zone DNS**, for your zone. Stored in
   `~/.config/foundry-manager/cloudflare.ini`, readable only by you (certbot
   reads the same file).
 - **Let's Encrypt email**: for expiry notices (optional).
@@ -63,7 +77,7 @@ Update later with `git -C ~/local-git/foundry-manager pull`.
 ## How it uses sudo
 
 The tool runs as you. Commands for the Foundry user run through
-`sudo -u komosatuo`; nginx, certbot and systemctl through `sudo`. It asks for
+`sudo -u <Foundry user>`; nginx, certbot and systemctl through `sudo`. It asks for
 your password once, checks it with `sudo -v`, and keeps it in memory only for
 this session; the commands themselves run with `sudo -n`, so the password is
 never passed to them.

@@ -37,9 +37,9 @@ CF_CREDENTIALS = CONFIG_DIR / "cloudflare.ini"  # certbot-dns-cloudflare format,
 MARKER = "# Written by Foundry Server Manager"
 
 DEFAULTS = {
-    "foundry_user": "komosatuo",
-    "existing_domain": "komosatuo.skotic.com",
-    "cloudflare_zone": "skotic.com",
+    "foundry_user": "",      # asked on first run (or --user NAME)
+    "existing_domain": "",   # found from that user's running server
+    "cloudflare_zone": "",   # the existing address's domain
     "letsencrypt_email": "",
     "nginx_dir": "",  # found from the existing site when empty
 }
@@ -77,6 +77,35 @@ def save_cloudflare_token(token: str) -> None:
     os.chmod(CF_CREDENTIALS, 0o600)
     CF_CREDENTIALS.write_text(f"dns_cloudflare_api_token = {token.strip()}\n")
     os.chmod(CF_CREDENTIALS, 0o600)
+
+
+def zone_of(fqdn: str) -> str:
+    """'play.example.com' -> 'example.com' (good for most domains; editable)."""
+    parts = [p for p in fqdn.strip().lower().split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else ""
+
+
+def detect_foundry_users() -> list[str]:
+    """Users running Foundry (node … main.js) or a pm2 daemon, most likely first."""
+    try:
+        out = subprocess.run(["ps", "-eo", "user:64=,args="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    foundry, pm2 = [], []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        user, args = parts
+        if user == "root":
+            continue
+        if re.search(r"node\S*\s+\S*main\.m?js", args) and re.search(r"foundry|--dataPath", args, re.I):
+            if user not in foundry:
+                foundry.append(user)
+        elif re.search(r"PM2 v\d|pm2\b.*God Daemon", args):
+            if user not in pm2:
+                pm2.append(user)
+    return foundry + [u for u in pm2 if u not in foundry]
 
 
 # ---------------------------------------------------------------------------
@@ -321,13 +350,31 @@ class LogDialog(QtWidgets.QDialog):
 # Dialogs
 # ---------------------------------------------------------------------------
 class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, parent, settings: dict):
+    def __init__(self, parent, settings: dict, first_run: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("Settings")
+        self.setWindowTitle("Set up " + APP if first_run else "Settings")
         form = QtWidgets.QFormLayout(self)
-        self.user = QtWidgets.QLineEdit(settings["foundry_user"])
+        if first_run:
+            intro = QtWidgets.QLabel(
+                "Which system user runs your Foundry servers (with pm2)? The tool manages that user's servers "
+                "and installs new ones in its home folder. Users already running Foundry are suggested.")
+            intro.setWordWrap(True)
+            form.addRow(intro)
+        # The Foundry user: an editable list of users seen running Foundry or pm2.
+        self.user = QtWidgets.QComboBox(editable=True)
+        found = detect_foundry_users()
+        current = settings["foundry_user"]
+        for u in ([current] if current else []) + [u for u in found if u != current]:
+            self.user.addItem(u)
+        self.user.setCurrentText(current or (found[0] if found else ""))
+        self.user.lineEdit().setPlaceholderText("e.g. foundry")
         self.domain = QtWidgets.QLineEdit(settings["existing_domain"])
+        self.domain.setPlaceholderText("filled in from your running server, if it has one")
         self.zone = QtWidgets.QLineEdit(settings["cloudflare_zone"])
+        self.zone.setPlaceholderText("e.g. example.com")
+        self.domain.textEdited.connect(lambda t: self.zone.setText(zone_of(t)) if not self._zone_edited else None)
+        self._zone_edited = bool(settings["cloudflare_zone"])
+        self.zone.textEdited.connect(lambda _t: setattr(self, "_zone_edited", True))
         self.email = QtWidgets.QLineEdit(settings["letsencrypt_email"])
         self.nginx = QtWidgets.QLineEdit(settings["nginx_dir"])
         self.nginx.setPlaceholderText("found from your existing site")
@@ -347,13 +394,28 @@ class SettingsDialog(QtWidgets.QDialog):
         hint.setStyleSheet("color: gray")
         form.addRow(hint)
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
+        btns.accepted.connect(self._check)
         btns.rejected.connect(self.reject)
         form.addRow(btns)
 
+    def _check(self):
+        user = self.user.currentText().strip()
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", user):
+            QtWidgets.QMessageBox.warning(self, APP, "Enter the system user that runs Foundry (e.g. foundry).")
+            return
+        try:
+            import pwd
+            pwd.getpwnam(user)
+        except KeyError:
+            QtWidgets.QMessageBox.warning(self, APP, f"There's no user called {user} on this machine.")
+            return
+        except ImportError:
+            pass
+        self.accept()
+
     def values(self) -> tuple[dict, str]:
         return ({
-            "foundry_user": self.user.text().strip(), "existing_domain": self.domain.text().strip(),
+            "foundry_user": self.user.currentText().strip(), "existing_domain": self.domain.text().strip(),
             "cloudflare_zone": self.zone.text().strip(), "letsencrypt_email": self.email.text().strip(),
             "nginx_dir": self.nginx.text().strip(),
         }, self.token.text().strip())
@@ -383,8 +445,11 @@ class AddDialog(QtWidgets.QDialog):
         src = QtWidgets.QHBoxLayout()
         src.addWidget(self.source)
         src.addWidget(pick)
-        self.dns = QtWidgets.QCheckBox(f"Create the DNS record in Cloudflare (CNAME to {settings['existing_domain']})")
-        self.dns.setChecked(bool(cloudflare_token()))
+        target = settings["existing_domain"]
+        self.dns = QtWidgets.QCheckBox(f"Create the DNS record in Cloudflare (CNAME to {target})" if target
+                                       else "Create the DNS record in Cloudflare (set the existing server address in Settings first)")
+        self.dns.setChecked(bool(cloudflare_token()) and bool(target))
+        self.dns.setEnabled(bool(target))
         self.proxied = QtWidgets.QCheckBox("Proxied through Cloudflare (orange cloud), like most sites")
         self.proxied.setChecked(True)
         self.cert = QtWidgets.QComboBox()
@@ -555,6 +620,13 @@ class Main(QtWidgets.QMainWindow):
                 s.extra = o
                 s.port = s.port or int(o.get("port") or 30000)
                 s.hostname = o.get("hostname") or ""
+            # First servers seen: remember the existing address (and its zone) for new subdomains.
+            if not self.settings["existing_domain"]:
+                host = next((s.hostname for s in self.servers if s.hostname), "")
+                if host:
+                    self.settings["existing_domain"] = host
+                    self.settings["cloudflare_zone"] = self.settings["cloudflare_zone"] or zone_of(host)
+                    save_settings(self.settings)
         self.update_status()
 
     def update_status(self):
@@ -614,9 +686,12 @@ class Main(QtWidgets.QMainWindow):
     def nginx_dir(self, log) -> str | None:
         if self.settings.get("nginx_dir"):
             return self.settings["nginx_dir"]
-        dom = re.escape(self.settings["existing_domain"])
-        code, out = self.runner.run(["grep", "-rlE", f"server_name[^;]*{dom}", "/etc/nginx"], root=True)
-        files = [f for f in out.splitlines() if f.strip() and not f.endswith("nginx.conf")]
+        files = []
+        code = 1
+        if self.settings["existing_domain"]:
+            dom = re.escape(self.settings["existing_domain"])
+            code, out = self.runner.run(["grep", "-rlE", f"server_name[^;]*{dom}", "/etc/nginx"], root=True)
+            files = [f for f in out.splitlines() if f.strip() and not f.endswith("nginx.conf")]
         if code == 0 and files:
             d = str(Path(files[0]).parent)
             # A file in sites-available is enabled by a link in sites-enabled.
@@ -824,9 +899,26 @@ class Main(QtWidgets.QMainWindow):
 
 
 def main():
-    app = QtWidgets.QApplication(sys.argv)
+    import argparse
+    ap = argparse.ArgumentParser(description=APP)
+    ap.add_argument("--user", help="the system user that runs Foundry (saved for next time)")
+    args, qt_args = ap.parse_known_args()
+    app = QtWidgets.QApplication([sys.argv[0]] + qt_args)
     app.setApplicationName(APP)
     app.setWindowIcon(QtGui.QIcon.fromTheme("applications-games"))
+    settings = load_settings()
+    if args.user:
+        settings["foundry_user"] = args.user.strip()
+        save_settings(settings)
+    # First run: ask which user runs Foundry (suggesting the ones running it).
+    if not settings["foundry_user"]:
+        dlg = SettingsDialog(None, settings, first_run=True)
+        if not dlg.exec():
+            return
+        settings, token = dlg.values()
+        save_settings(settings)
+        if token:
+            save_cloudflare_token(token)
     w = Main()
     w.show()
     sys.exit(app.exec())
