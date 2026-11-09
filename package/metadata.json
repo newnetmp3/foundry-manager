@@ -7,7 +7,7 @@
         "Id": "io.github.newnetmp3.foundryplayers",
         "License": "MIT",
         "Name": "Foundry VTT Players",
-        "Version": "1.0",
+        "Version": "1.1",
         "Website": "https://github.com/newnetmp3/roll20embetterment/tree/main/kde-widget"
     },
     "KPackageStructure": "Plasma/Applet",

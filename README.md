@@ -1,7 +1,9 @@
 # Foundry VTT Players (KDE Plasma 6 widget)
 
 Shows how many people are connected to a Foundry VTT server, on the desktop
-or in a panel. Click it for the world, Foundry and system versions; right-click
+or in a panel, next to Foundry's logo (loaded from your own server's
+`/icons/vtt-512.png`, the same file browsers get; the theme's games icon
+stands in until it loads). Click it for the world, Foundry and system versions; right-click
 for **Check now** and **Open Foundry**.
 
 It reads Foundry's own status page, `/api/status`, which anyone can read, so

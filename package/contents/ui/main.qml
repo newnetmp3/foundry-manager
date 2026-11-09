@@ -32,6 +32,9 @@ PlasmoidItem {
 
     readonly property string statusUrl: Plasmoid.configuration.statusUrl
     readonly property bool online: reachable && worldActive
+    // Foundry's logo, as the server itself serves it to browsers (not copied
+    // into this widget): <server>/icons/vtt-512.png.
+    readonly property string logoUrl: String(statusUrl).replace(/\/api\/status\/?$/, "") + "/icons/vtt-512.png"
 
     Plasmoid.icon: "applications-games"
     Plasmoid.status: online && users > 0 ? PlasmaCore.Types.ActiveStatus : PlasmaCore.Types.PassiveStatus
@@ -146,6 +149,32 @@ PlasmoidItem {
         }
     ]
 
+    // Foundry's logo from the server; the theme's games icon until it loads (or
+    // if it can't). Faded while the server is down or no world is running.
+    component Logo: Item {
+        property string url: ""
+        property bool dim: false
+        opacity: dim ? 0.45 : 1
+        Image {
+            id: logoImage
+            anchors.fill: parent
+            source: parent.url
+            sourceSize.width: 128
+            sourceSize.height: 128
+            fillMode: Image.PreserveAspectFit
+            smooth: true
+            mipmap: true
+            asynchronous: true
+            cache: true
+            visible: status === Image.Ready
+        }
+        Kirigami.Icon {
+            anchors.fill: parent
+            source: "applications-games"
+            visible: logoImage.status !== Image.Ready
+        }
+    }
+
     // ---- panel / desktop icon with the count ------------------------------------
     compactRepresentation: MouseArea {
         id: compact
@@ -158,11 +187,11 @@ PlasmoidItem {
             id: row
             anchors.centerIn: parent
             spacing: Kirigami.Units.smallSpacing
-            Kirigami.Icon {
-                source: "applications-games"
+            Logo {
+                url: root.logoUrl
+                dim: !root.online
                 Layout.preferredWidth: Math.min(compact.height, Kirigami.Units.iconSizes.medium)
                 Layout.preferredHeight: Layout.preferredWidth
-                opacity: root.online ? 1 : 0.45
             }
             PlasmaComponents.Label {
                 text: root.countText()
@@ -181,9 +210,18 @@ PlasmoidItem {
         Layout.minimumHeight: Kirigami.Units.gridUnit * 8
         spacing: Kirigami.Units.smallSpacing
 
-        Kirigami.Heading {
-            level: 2
-            text: i18n("Foundry VTT")
+        RowLayout {
+            spacing: Kirigami.Units.smallSpacing
+            Logo {
+                url: root.logoUrl
+                dim: !root.online
+                Layout.preferredWidth: Kirigami.Units.iconSizes.medium
+                Layout.preferredHeight: Kirigami.Units.iconSizes.medium
+            }
+            Kirigami.Heading {
+                level: 2
+                text: i18n("Foundry VTT")
+            }
         }
         RowLayout {
             spacing: Kirigami.Units.largeSpacing
