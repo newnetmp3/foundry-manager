@@ -28,17 +28,25 @@ data folder.
 sudo pacman -S --needed pyside6 certbot certbot-nginx certbot-dns-cloudflare unzip curl
 ```
 
+Get it:
+
+```bash
+git clone https://github.com/newnetmp3/foundry-manager.git ~/local-git/foundry-manager
+```
+
 Run it:
 
 ```bash
-python3 ~/local-git/roll20embetterment/foundry-manager/foundry_manager.py
+python3 ~/local-git/foundry-manager/foundry_manager.py
 ```
 
 Or add it to the application menu:
 
 ```bash
-cp ~/local-git/roll20embetterment/foundry-manager/foundry-manager.desktop ~/.local/share/applications/
+cp ~/local-git/foundry-manager/foundry-manager.desktop ~/.local/share/applications/
 ```
+
+Update later with `git -C ~/local-git/foundry-manager pull`.
 
 ## First run: Settings
 
@@ -65,5 +73,6 @@ never passed to them.
 - Cloudflare's SSL/TLS mode for the zone should be **Full** or **Full
   (strict)**, as it already is if your existing server works through it.
 - Each server needs its own port (30000, 30001, …) and its own data folder.
-- The [Foundry VTT Players](../kde-widget) widget can watch each server: add a
-  copy per server, with its own status address.
+- The [Foundry VTT Players](https://github.com/newnetmp3/roll20embetterment/tree/main/kde-widget)
+  KDE widget can watch each server: add a copy per server, with its own
+  status address.
