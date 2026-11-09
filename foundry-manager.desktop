@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Foundry Server Manager
-Comment=Run and add Foundry VTT servers
-Exec=python3 %h/local-git/foundry-manager/foundry_manager.py
-Icon=applications-games
-Categories=Game;Network;
-Terminal=false

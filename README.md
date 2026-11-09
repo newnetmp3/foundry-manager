@@ -34,17 +34,15 @@ Get it:
 git clone https://github.com/newnetmp3/foundry-manager.git ~/local-git/foundry-manager
 ```
 
-Run it:
+Install the `foundry-manager` command and the application-menu entry (no
+sudo; it links into `~/.local/bin` and `~/.local/share/applications`):
 
 ```bash
-python3 ~/local-git/foundry-manager/foundry_manager.py
+~/local-git/foundry-manager/install.sh
 ```
 
-Or add it to the application menu:
-
-```bash
-cp ~/local-git/foundry-manager/foundry-manager.desktop ~/.local/share/applications/
-```
+Then run it from a terminal with `foundry-manager`, or from the application
+menu (Games → Foundry Server Manager). `./install.sh --remove` undoes it.
 
 Update later with `git -C ~/local-git/foundry-manager pull`.
 
@@ -71,7 +69,7 @@ Nothing on the system changes during setup. Run it again any time with
 To set the user from the command line instead (saved for next time):
 
 ```bash
-python3 ~/local-git/foundry-manager/foundry_manager.py --user foundry
+foundry-manager --user foundry
 ```
 
 ## Adding a server
