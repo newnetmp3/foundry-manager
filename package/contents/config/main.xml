@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0 http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="statusUrl" type="String">
+      <label>Foundry's status page (the server address followed by /api/status)</label>
+      <default>http://localhost:30000/api/status</default>
+    </entry>
+    <entry name="interval" type="Int">
+      <label>Seconds between checks</label>
+      <default>15</default>
+      <min>3</min>
+      <max>3600</max>
+    </entry>
+    <entry name="useSocketFallback" type="Bool">
+      <label>If the status page doesn't give a count, count connections to the port with ss</label>
+      <default>true</default>
+    </entry>
+    <entry name="port" type="Int">
+      <label>Foundry's port (for counting connections)</label>
+      <default>30000</default>
+      <min>1</min>
+      <max>65535</max>
+    </entry>
+  </group>
+</kcfg>
