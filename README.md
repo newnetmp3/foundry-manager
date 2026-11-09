@@ -48,31 +48,38 @@ cp ~/local-git/foundry-manager/foundry-manager.desktop ~/.local/share/applicatio
 
 Update later with `git -C ~/local-git/foundry-manager pull`.
 
-## First run: Settings
+## First run: the setup guide
 
-The first time it starts, the tool asks which system user runs Foundry. It
-suggests users it finds already running Foundry or pm2, so usually you just
-confirm. You can also set it from the command line (saved for next time):
+The first time it starts, a step-by-step guide asks what the tool needs, one
+question per page, each with an explanation of why:
+
+1. **Which user runs Foundry.** It suggests users it finds already running
+   Foundry or pm2, so usually you just confirm.
+2. **Your existing server's address** (for example `play.example.com`), read
+   from the running server where possible. New addresses point at it, and new
+   nginx sites go next to its site file. Leave it empty if you have none yet.
+3. **Cloudflare** (optional): your zone and an API token, with a **Test token**
+   button. The page explains how to make a token (template **Edit zone DNS**).
+   The token is stored in `~/.config/foundry-manager/cloudflare.ini`, readable
+   only by you.
+4. **Let's Encrypt email and nginx folder** (both optional).
+5. A summary to check before saving.
+
+Nothing on the system changes during setup. Run it again any time with
+**Setup guide…** on the toolbar, or change single answers under **Settings…**.
+
+To set the user from the command line instead (saved for next time):
 
 ```bash
 python3 ~/local-git/foundry-manager/foundry_manager.py --user foundry
 ```
 
-Everything here can be changed later under **Settings**:
+## Adding a server
 
-- **Foundry runs as user**: the user pm2 runs Foundry as (for example
-  `foundry`). New servers are installed in that user's home folder.
-- **Existing server address**: for example `play.example.com`. Filled in from
-  your running server's `options.json` when it has one. New subdomains point at
-  it (CNAME), and the new nginx site goes next to its nginx file. Leave it
-  empty if you don't have one yet; DNS records then aren't created for you.
-- **Cloudflare zone**: the domain in Cloudflare, for example `example.com`
-  (worked out from the address).
-- **Cloudflare API token**: dash.cloudflare.com → My Profile → API Tokens →
-  Create Token → **Edit zone DNS**, for your zone. Stored in
-  `~/.config/foundry-manager/cloudflare.ini`, readable only by you (certbot
-  reads the same file).
-- **Let's Encrypt email**: for expiry notices (optional).
+**Add server…** walks through the same way: what you'll need, name and
+address, the DNS record, port and folders, the HTTPS certificate, and last the
+Foundry download (last because the timed link expires after a few minutes).
+A summary page shows everything before **Create server** changes anything.
 
 ## How it uses sudo
 

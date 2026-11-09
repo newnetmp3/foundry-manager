@@ -350,16 +350,12 @@ class LogDialog(QtWidgets.QDialog):
 # Dialogs
 # ---------------------------------------------------------------------------
 class SettingsDialog(QtWidgets.QDialog):
-    def __init__(self, parent, settings: dict, first_run: bool = False):
+    def __init__(self, parent, settings: dict):
         super().__init__(parent)
-        self.setWindowTitle("Set up " + APP if first_run else "Settings")
+        self.setWindowTitle("Settings")
         form = QtWidgets.QFormLayout(self)
-        if first_run:
-            intro = QtWidgets.QLabel(
-                "Which system user runs your Foundry servers (with pm2)? The tool manages that user's servers "
-                "and installs new ones in its home folder. Users already running Foundry are suggested.")
-            intro.setWordWrap(True)
-            form.addRow(intro)
+        intro = note("Quick edit of the setup answers. <b>Setup guide…</b> on the toolbar explains each one.")
+        form.addRow(intro)
         # The Foundry user: an editable list of users seen running Foundry or pm2.
         self.user = QtWidgets.QComboBox(editable=True)
         found = detect_foundry_users()
@@ -421,59 +417,537 @@ class SettingsDialog(QtWidgets.QDialog):
         }, self.token.text().strip())
 
 
-class AddDialog(QtWidgets.QDialog):
+# ---------------------------------------------------------------------------
+# Step-by-step wizards
+# ---------------------------------------------------------------------------
+def explain(html: str) -> QtWidgets.QLabel:
+    """A paragraph of explanation on a wizard page."""
+    lab = QtWidgets.QLabel(html)
+    lab.setWordWrap(True)
+    lab.setTextFormat(QtCore.Qt.RichText)
+    lab.setOpenExternalLinks(True)
+    lab.setTextInteractionFlags(QtCore.Qt.TextBrowserInteraction)
+    return lab
+
+
+def note(text: str) -> QtWidgets.QLabel:
+    """A smaller grey hint under a field."""
+    lab = explain(text)
+    lab.setStyleSheet("color: gray")
+    return lab
+
+
+def page(title: str, subtitle: str = "") -> tuple[QtWidgets.QWizardPage, QtWidgets.QVBoxLayout]:
+    p = QtWidgets.QWizardPage()
+    p.setTitle(title)
+    if subtitle:
+        p.setSubTitle(subtitle)
+    lay = QtWidgets.QVBoxLayout(p)
+    lay.setSpacing(8)
+    return p, lay
+
+
+class CheckedPage(QtWidgets.QWizardPage):
+    """A page whose Next button runs a check first (a message explains what's wrong)."""
+    def __init__(self, title, subtitle, check):
+        super().__init__()
+        self.setTitle(title)
+        self.setSubTitle(subtitle)
+        self.check = check
+        self.lay = QtWidgets.QVBoxLayout(self)
+        self.lay.setSpacing(8)
+
+    def validatePage(self):
+        problem = self.check()
+        if problem:
+            QtWidgets.QMessageBox.warning(self, APP, problem)
+            return False
+        return True
+
+
+def user_exists(user: str) -> bool:
+    try:
+        import pwd
+        pwd.getpwnam(user)
+        return True
+    except KeyError:
+        return False
+    except ImportError:
+        return True
+
+
+def detect_existing_domain(user: str) -> str:
+    """The hostname in the options.json of a server this user runs, if we can read it."""
+    try:
+        out = subprocess.run(["ps", "-u", user, "-o", "args="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in out.splitlines():
+        m = re.search(r"--dataPath[= ](\S+)", line)
+        if not m:
+            continue
+        try:
+            with open(Path(m.group(1)) / "Config" / "options.json", encoding="utf-8") as f:
+                host = json.load(f).get("hostname") or ""
+        except (OSError, ValueError):
+            continue
+        if host:
+            return host
+    return ""
+
+
+def wizard(parent, title: str) -> QtWidgets.QWizard:
+    w = QtWidgets.QWizard(parent)
+    w.setWindowTitle(title)
+    w.setWizardStyle(QtWidgets.QWizard.ModernStyle)
+    w.setOption(QtWidgets.QWizard.NoBackButtonOnStartPage, True)
+    w.resize(680, 560)
+    return w
+
+
+class SetupWizard:
+    """First-run setup (and re-runnable from the toolbar): one question per page, with the reason for it."""
+
+    def __init__(self, parent, settings: dict):
+        self.settings = dict(settings)
+        self.w = wz = wizard(parent, "Set up " + APP)
+
+        # 1. Welcome
+        p, lay = page("Welcome", "A few questions so this tool can find and manage your Foundry servers.")
+        lay.addWidget(explain(
+            "<p>This tool runs and adds <b>Foundry VTT</b> servers (the Node.js version) on this machine. "
+            "Each server gets its own web address, port, install folder and data folder, and is kept running by "
+            "<b>pm2</b>. nginx puts them on the web with HTTPS.</p>"
+            "<p>The next pages ask:</p><ol>"
+            "<li>Which system user runs Foundry.</li>"
+            "<li>The address of the server you already have (if any).</li>"
+            "<li>Your Cloudflare details, if your DNS is on Cloudflare (optional).</li>"
+            "<li>An email for certificate notices (optional).</li></ol>"
+            "<p>Nothing on the system changes during setup: answers are only saved to "
+            f"<code>{SETTINGS_FILE}</code>. You can change them later under <b>Settings</b>.</p>"
+            "<p>Later, when the tool needs to change something (start a server, write an nginx site), it asks for "
+            "your <b>sudo password</b> once and keeps it in memory only until you close it.</p>"))
+        lay.addStretch()
+        wz.addPage(p)
+
+        # 2. Foundry user
+        self.user = QtWidgets.QComboBox(editable=True)
+        found = detect_foundry_users()
+        current = settings["foundry_user"]
+        for u in ([current] if current else []) + [u for u in found if u != current]:
+            self.user.addItem(u)
+        self.user.setCurrentText(current or (found[0] if found else ""))
+        self.user.lineEdit().setPlaceholderText("e.g. foundry")
+
+        def check_user():
+            u = self.user.currentText().strip()
+            if not re.fullmatch(r"[a-z_][a-z0-9_-]*\$?", u):
+                return "Enter the name of the system user that runs Foundry, such as foundry."
+            if not user_exists(u):
+                return (f"There's no user called {u} on this machine.\n\nCreate one first, for example:\n"
+                        f"sudo useradd -m {u}\n\nthen install pm2 for it (npm install -g pm2) and come back.")
+            return ""
+        p = CheckedPage("Which user runs Foundry?", "Foundry runs as its own system user, not as you.", check_user)
+        p.lay.addWidget(explain(
+            "<p>Running Foundry under a separate user keeps it away from your own files: if a module or the "
+            "server misbehaves, it can only touch that user's folders.</p>"
+            "<p>This tool asks that user's <b>pm2</b> which servers it runs, and installs new servers in that "
+            "user's home folder.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("Foundry runs as user:", self.user)
+        p.lay.addLayout(form)
+        p.lay.addWidget(note(
+            ("Suggested: " + ", ".join(found) + " (seen running Foundry or pm2 right now).") if found else
+            "No user is running Foundry or pm2 right now, so there's nothing to suggest. Type the user's name."))
+        p.lay.addStretch()
+        wz.addPage(p)
+
+        # 3. Existing server address
+        self.domain = QtWidgets.QLineEdit(settings["existing_domain"])
+        self.domain.setPlaceholderText("e.g. play.example.com (or leave empty)")
+        self.domain_note = note("")
+
+        def check_domain():
+            d = self.domain.text().strip().lower()
+            if d and not re.fullmatch(r"(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,}", d):
+                return "Enter just the address, like play.example.com (no https:// or /join)."
+            return ""
+        p = CheckedPage("Your existing server's address",
+                        "The web address players use for the server you already run.", check_domain)
+        p.lay.addWidget(explain(
+            "<p>It's used in two ways when you add a server:</p><ul>"
+            "<li><b>DNS:</b> the new address (say <code>second.example.com</code>) is pointed at this one "
+            "with a CNAME record, so it reaches the same machine without you looking up its IP.</li>"
+            "<li><b>nginx:</b> the new site file goes in the same folder as this address's site file, "
+            "so nginx loads it the same way.</li></ul>"
+            "<p>No server yet? Leave it empty: new servers still install, and you add their DNS record "
+            "yourself.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("Existing address:", self.domain)
+        p.lay.addLayout(form)
+        p.lay.addWidget(self.domain_note)
+        p.lay.addStretch()
+        p.initializePage = self._fill_domain
+        wz.addPage(p)
+
+        # 4. Cloudflare
+        self.zone = QtWidgets.QLineEdit(settings["cloudflare_zone"])
+        self.zone.setPlaceholderText("e.g. example.com")
+        self.token = QtWidgets.QLineEdit(cloudflare_token())
+        self.token.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.token.setPlaceholderText("leave empty to skip Cloudflare")
+        test = QtWidgets.QPushButton("Test token")
+        test.clicked.connect(self._test_token)
+        self.token_result = note("")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.token)
+        row.addWidget(test)
+
+        def check_cf():
+            if self.token.text().strip() and not self.zone.text().strip():
+                return "With a token, also enter the Cloudflare zone (your domain, like example.com)."
+            return ""
+        p = CheckedPage("Cloudflare (optional)", "Lets the tool create DNS records and certificates for you.", check_cf)
+        p.lay.addWidget(explain(
+            "<p>If your domain's DNS is on Cloudflare, an <b>API token</b> lets this tool:</p><ul>"
+            "<li>add the DNS record for each new server's address, and</li>"
+            "<li>get its HTTPS certificate from Let's Encrypt by proving you own the domain through DNS, "
+            "which works even with Cloudflare's proxy (orange cloud) on.</li></ul>"
+            "<p><b>Zone</b> is the domain as Cloudflare lists it, for example <code>example.com</code>.</p>"
+            "<p><b>To make a token:</b> <a href='https://dash.cloudflare.com/profile/api-tokens'>"
+            "dash.cloudflare.com → My Profile → API Tokens</a> → Create Token → use the "
+            "<b>Edit zone DNS</b> template → under Zone Resources pick your domain → Create. "
+            "That token can only change DNS for that one domain.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("Cloudflare zone:", self.zone)
+        form.addRow("API token:", row)
+        p.lay.addLayout(form)
+        p.lay.addWidget(self.token_result)
+        p.lay.addWidget(note(
+            f"The token is saved in {CF_CREDENTIALS}, readable only by you. Not on Cloudflare? Leave both empty "
+            "and Next: you'll add DNS records yourself, and certificates are checked over HTTP instead."))
+        p.lay.addStretch()
+        p.initializePage = lambda: self.zone.text() or self.zone.setText(zone_of(self.domain.text()))
+        wz.addPage(p)
+
+        # 5. Certificates and nginx
+        self.email = QtWidgets.QLineEdit(settings["letsencrypt_email"])
+        self.email.setPlaceholderText("you@example.com (optional)")
+        self.nginx = QtWidgets.QLineEdit(settings["nginx_dir"])
+        self.nginx.setPlaceholderText("leave empty to find it automatically")
+
+        def check_email():
+            e = self.email.text().strip()
+            if e and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e):
+                return "That doesn't look like an email address (or leave it empty)."
+            return ""
+        p = CheckedPage("Certificates and nginx", "Both optional: the defaults work for most setups.", check_email)
+        p.lay.addWidget(explain(
+            "<p><b>Let's Encrypt email.</b> Each server's address gets a free HTTPS certificate from Let's "
+            "Encrypt. They renew on their own; this email only gets a warning if a renewal keeps failing. "
+            "It isn't shared or used for anything else. Empty is fine.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("Let's Encrypt email:", self.email)
+        p.lay.addLayout(form)
+        p.lay.addWidget(explain(
+            "<p><b>nginx sites folder.</b> Where new site files go. Left empty, the tool uses the folder of your "
+            "existing server's site, or the folder your <code>nginx.conf</code> includes "
+            "(such as <code>/etc/nginx/sites-available</code>). Only fill this in if that guesses wrong.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("nginx sites folder:", self.nginx)
+        p.lay.addLayout(form)
+        p.lay.addStretch()
+        wz.addPage(p)
+
+        # 6. Summary
+        self.summary = explain("")
+        p, lay = page("Ready", "Check your answers. Back changes them; Finish saves them.")
+        lay.addWidget(self.summary)
+        lay.addStretch()
+        p.initializePage = self._fill_summary
+        wz.addPage(p)
+        wz.setButtonText(QtWidgets.QWizard.FinishButton, "Save")
+
+    # ---- page helpers ----------------------------------------------------------------
+    def _fill_domain(self):
+        if self.domain.text().strip():
+            self.domain_note.setText("")
+            return
+        found = detect_existing_domain(self.user.currentText().strip())
+        if found:
+            self.domain.setText(found)
+            self.domain_note.setText(f"Found in your running server's options.json: {found}. Change it if that's wrong.")
+        else:
+            self.domain_note.setText("Couldn't read it from the running server (it may belong to another user). "
+                                     "It's filled in automatically the first time the server list loads, "
+                                     "or type it here.")
+
+    def _test_token(self):
+        token, zone = self.token.text().strip(), self.zone.text().strip()
+        if not token:
+            self.token_result.setText("Enter a token first.")
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            v = cloudflare("GET", "/user/tokens/verify", token)
+            z = cloudflare("GET", "/zones?name=" + zone, token) if v.get("success") and zone else {}
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if not v.get("success"):
+            msg = "; ".join(e.get("message", "") for e in v.get("errors") or []) or "no answer"
+            self.token_result.setText(f"✗ Cloudflare didn't accept the token ({msg}).")
+        elif not zone:
+            self.token_result.setText("✓ The token works. Enter the zone too.")
+        elif z.get("result"):
+            self.token_result.setText(f"✓ The token works and can see {zone}.")
+        else:
+            self.token_result.setText(f"✗ The token works but can't see the zone {zone}: check the zone name, "
+                                      "or the token's Zone Resources.")
+
+    def _fill_summary(self):
+        v, token = self.values()
+        def row(k, val, empty):
+            return f"<tr><td><b>{k}</b></td><td>{val if val else '<i>' + empty + '</i>'}</td></tr>"
+        self.summary.setText(
+            "<table cellspacing='6'>"
+            + row("Foundry user", v["foundry_user"], "")
+            + row("Existing address", v["existing_domain"], "none: you'll add DNS records yourself")
+            + row("Cloudflare zone", v["cloudflare_zone"], "none")
+            + row("Cloudflare token", "saved (hidden)" if token else "", "none: no automatic DNS")
+            + row("Let's Encrypt email", v["letsencrypt_email"], "none")
+            + row("nginx sites folder", v["nginx_dir"], "found automatically")
+            + "</table><p>After saving, the main window lists the servers pm2 runs for "
+            f"<b>{v['foundry_user']}</b>. Use <b>Add server…</b> to set up another one; it walks you through it "
+            "the same way.</p>")
+
+    def exec(self) -> bool:
+        return bool(self.w.exec())
+
+    def values(self) -> tuple[dict, str]:
+        return ({
+            "foundry_user": self.user.currentText().strip(),
+            "existing_domain": self.domain.text().strip().lower(),
+            "cloudflare_zone": self.zone.text().strip().lower(),
+            "letsencrypt_email": self.email.text().strip(),
+            "nginx_dir": self.nginx.text().strip(),
+        }, self.token.text().strip())
+
+
+class AddWizard:
+    """Adding a server, one decision per page, each with the reason it's asked."""
+
     def __init__(self, parent, settings: dict, used_ports: set[int], home: str):
-        super().__init__(parent)
-        self.setWindowTitle("Add a Foundry server")
-        self.resize(560, 0)
-        form = QtWidgets.QFormLayout(self)
+        self.settings = settings
+        self.home = home
+        self.w = wz = wizard(parent, "Add a Foundry server")
+        has_token = bool(cloudflare_token())
+        target = settings["existing_domain"]
+        zone = settings["cloudflare_zone"]
+
+        # 1. Before you start
+        p, lay = page("Before you start", "What a new server needs, and what this wizard will do.")
+        lay.addWidget(explain(
+            "<p>You'll need:</p><ul>"
+            "<li><b>A Foundry licence key that isn't in use.</b> Each server running at the same time needs its "
+            "own key. You enter it in the browser at the end, not here.</li>"
+            "<li><b>A web address</b> for the new server, such as <code>second.example.com</code>.</li>"
+            "<li><b>The Foundry download</b> (Node.js version): a timed link from foundryvtt.com, or the zip.</li>"
+            "<li><b>Your sudo password</b>, asked once when the work starts.</li></ul>"
+            "<p>When you click <b>Create server</b> on the last page, the tool:</p><ol>"
+            "<li>makes the install and data folders,</li>"
+            "<li>downloads and unpacks Foundry,</li>"
+            "<li>writes Foundry's <code>options.json</code> (port and address),</li>"
+            "<li>starts it under pm2 so it runs after reboots,</li>"
+            "<li>adds the DNS record (if you choose),</li>"
+            "<li>gets an HTTPS certificate, and</li>"
+            "<li>adds an nginx site that forwards the address to the server.</li></ol>"
+            "<p>Nothing changes until that last click, and your existing servers aren't touched.</p>"))
+        lay.addStretch()
+        wz.addPage(p)
+
+        # 2. Name and address
+        n = 2
+        self.name = QtWidgets.QLineEdit(f"foundry{n}")
+        self.fqdn = QtWidgets.QLineEdit(f"second.{zone}" if zone else "")
+        self.fqdn.setPlaceholderText("e.g. second.example.com")
+
+        def check_name():
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", self.name.text()):
+                return "Name: letters, digits, - and _ only (no spaces)."
+            if not re.fullmatch(r"(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,}", self.fqdn.text().strip().lower()):
+                return "Address: a full domain name such as second.example.com (no https://)."
+            if self.fqdn.text().strip().lower() == target:
+                return f"{target} is your existing server's address: pick a new one."
+            return ""
+        p = CheckedPage("Name and address", "How you and your players will tell this server apart.", check_name)
+        p.lay.addWidget(explain(
+            "<p><b>Name</b> is what pm2 calls the server (you'll see it in the list and in <code>pm2 list</code>). "
+            "It also names its folders and its nginx file. Short and without spaces, like <code>foundry2</code>.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("Name:", self.name)
+        p.lay.addLayout(form)
+        p.lay.addWidget(explain(
+            "<p><b>Address</b> is the web address players open, so it must be one you own: a new subdomain "
+            "of your domain is easiest. It has to differ from your existing server's address, because nginx "
+            "uses the address to tell which server a visitor wants.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("Address:", self.fqdn)
+        p.lay.addLayout(form)
+        p.lay.addStretch()
+        wz.addPage(p)
+
+        # 3. DNS
+        self.dns = QtWidgets.QCheckBox(f"Create the DNS record in Cloudflare (CNAME to {target or '…'})")
+        self.dns.setChecked(has_token and bool(target))
+        self.dns.setEnabled(has_token and bool(target))
+        self.proxied = QtWidgets.QCheckBox("Proxied through Cloudflare (orange cloud)")
+        self.proxied.setChecked(True)
+        self.dns.toggled.connect(self.proxied.setEnabled)
+        self.proxied.setEnabled(self.dns.isChecked())
+        self.dns_note = note("")
+        p, lay = page("DNS record", "So the new address leads to this machine.")
+        lay.addWidget(explain(
+            "<p>A browser finds a server through a <b>DNS record</b>. The new address gets a <b>CNAME</b> record "
+            f"pointing at <code>{target or 'your existing address'}</code>: “this name lives wherever that one "
+            "does”. If this machine's IP ever changes, only the existing record needs updating.</p>"
+            "<p><b>Proxied</b> (Cloudflare's orange cloud) sends visitors through Cloudflare, which hides "
+            "this machine's IP and filters attacks. Foundry works fine through it. Turn it off only if you "
+            "want players to connect directly.</p>"))
+        lay.addWidget(self.dns)
+        lay.addWidget(self.proxied)
+        lay.addWidget(self.dns_note)
+        lay.addStretch()
+        def init_dns():
+            fq = self.fqdn.text().strip().lower()
+            if not has_token:
+                self.dns_note.setText("No Cloudflare token is saved (Settings), so add this record yourself in your "
+                                      f"DNS provider: CNAME <b>{fq}</b> → <b>{target or 'this machine'}</b> "
+                                      "(or an A record with this machine's IP). Do it before Create, so the "
+                                      "certificate step can find the address.")
+            elif not target:
+                self.dns_note.setText("There's no existing server address in Settings to point at, so add the "
+                                      f"record for <b>{fq}</b> yourself (an A record with this machine's IP).")
+            elif zone and not fq.endswith("." + zone) and fq != zone:
+                self.dns.setChecked(False)
+                self.dns_note.setText(f"{fq} isn't in your Cloudflare zone {zone}, so the tool can't add its record: "
+                                      "add it yourself where that domain's DNS is.")
+            else:
+                self.dns_note.setText("If Cloudflare already has a record for this address, it's left as it is.")
+        p.initializePage = init_dns
+        wz.addPage(p)
+
+        # 4. Port and folders
         port = 30001
         while port in used_ports or not port_free(port):
             port += 1
-        n = 2
-        self.name = QtWidgets.QLineEdit(f"foundry{n}")
-        zone = settings["cloudflare_zone"]
-        self.fqdn = QtWidgets.QLineEdit(f"second.{zone}" if zone else "")
         self.port = QtWidgets.QSpinBox(minimum=1024, maximum=65535, value=port)
         self.app_dir = QtWidgets.QLineEdit(f"{home}/foundry{n}")
         self.data_dir = QtWidgets.QLineEdit(f"{home}/foundrydata{n}")
         self.name.textEdited.connect(self._names)
-        self.source = QtWidgets.QLineEdit()
-        self.source.setPlaceholderText("timed Node.js download link from foundryvtt.com, or a .zip file")
-        pick = QtWidgets.QPushButton("Zip file…")
-        pick.clicked.connect(self._pick)
-        src = QtWidgets.QHBoxLayout()
-        src.addWidget(self.source)
-        src.addWidget(pick)
-        target = settings["existing_domain"]
-        self.dns = QtWidgets.QCheckBox(f"Create the DNS record in Cloudflare (CNAME to {target})" if target
-                                       else "Create the DNS record in Cloudflare (set the existing server address in Settings first)")
-        self.dns.setChecked(bool(cloudflare_token()) and bool(target))
-        self.dns.setEnabled(bool(target))
-        self.proxied = QtWidgets.QCheckBox("Proxied through Cloudflare (orange cloud), like most sites")
-        self.proxied.setChecked(True)
-        self.cert = QtWidgets.QComboBox()
-        self.cert.addItems(["Cloudflare DNS (certbot-dns-cloudflare)", "nginx (HTTP check)", "Skip (I'll add a certificate myself)"])
-        if not cloudflare_token():
-            self.cert.setCurrentIndex(1)
-        form.addRow("Name (pm2):", self.name)
-        form.addRow("Address:", self.fqdn)
+
+        def check_where():
+            if self.port.value() in used_ports:
+                return f"Port {self.port.value()} belongs to another of your servers."
+            if not port_free(self.port.value()):
+                return f"Something on this machine already uses port {self.port.value()}: pick another."
+            a, d = self.app_dir.text().strip(), self.data_dir.text().strip()
+            if not a.startswith("/") or not d.startswith("/"):
+                return "Folders: full paths, starting with /."
+            if a == d or d.startswith(a.rstrip("/") + "/") or a.startswith(d.rstrip("/") + "/"):
+                return "Keep the install folder and the data folder separate (neither inside the other)."
+            return ""
+        p = CheckedPage("Port and folders", "Where the server listens, and where its files go.", check_where)
+        p.lay.addWidget(explain(
+            "<p><b>Port.</b> Every Foundry server on the machine needs its own port; your first one usually has "
+            "30000. Players never see it: nginx takes visits to the address on the normal HTTPS port and "
+            "forwards them here. The first free one is filled in.</p>"))
+        form = QtWidgets.QFormLayout()
         form.addRow("Port:", self.port)
+        p.lay.addLayout(form)
+        p.lay.addWidget(explain(
+            "<p><b>Install folder</b> holds Foundry's program files, replaced when you update Foundry. "
+            "<b>Data folder</b> holds everything that's yours: worlds, modules, systems, uploaded art and the "
+            "licence. Keeping them apart means an update can't touch your worlds. Each server needs its own "
+            f"data folder. Both go in {settings['foundry_user']}'s home folder so that user owns them.</p>"))
+        form = QtWidgets.QFormLayout()
         form.addRow("Install folder:", self.app_dir)
         form.addRow("Data folder:", self.data_dir)
-        form.addRow("Foundry download:", src)
-        form.addRow("", self.dns)
-        form.addRow("", self.proxied)
-        form.addRow("Certificate:", self.cert)
-        note = QtWidgets.QLabel("The licence key is entered in the browser on first visit: use your second key.")
-        note.setStyleSheet("color: gray")
-        form.addRow(note)
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        btns.button(QtWidgets.QDialogButtonBox.Ok).setText("Create server")
-        btns.accepted.connect(self._check)
-        btns.rejected.connect(self.reject)
-        form.addRow(btns)
-        self.home = home
+        p.lay.addLayout(form)
+        p.lay.addStretch()
+        wz.addPage(p)
+
+        # 5. HTTPS certificate
+        self.cert = QtWidgets.QButtonGroup(wz)
+        opts = [
+            ("cloudflare", "Through Cloudflare DNS (recommended with Cloudflare)",
+             "certbot proves you own the domain by adding a temporary DNS record with your token. Works with the "
+             "orange cloud on." + ("" if has_token else " <i>Needs a Cloudflare token in Settings.</i>")),
+            ("nginx", "Through nginx (HTTP check)",
+             "Let's Encrypt visits the address over plain HTTP to check it reaches this machine. Needs the DNS "
+             "record in place and port 80 open from the internet."),
+            ("skip", "Skip: I'll add a certificate myself",
+             "The nginx site expects one at /etc/letsencrypt/live/&lt;address&gt;/; nginx won't load the site "
+             "until it's there."),
+        ]
+        p, lay = page("HTTPS certificate", "So browsers connect securely and show the padlock.")
+        lay.addWidget(explain(
+            "<p>Browsers need a certificate for the new address before they'll connect over HTTPS. "
+            "<b>Let's Encrypt</b> gives them free, and certbot renews them automatically. First it has to "
+            "check that you control the address. Choose how:</p>"))
+        for i, (key, label, why) in enumerate(opts):
+            rb = QtWidgets.QRadioButton(label)
+            self.cert.addButton(rb, i)
+            lay.addWidget(rb)
+            hint = note(why)
+            hint.setContentsMargins(24, 0, 0, 6)
+            lay.addWidget(hint)
+            if key == "cloudflare" and not has_token:
+                rb.setEnabled(False)
+        self.cert.button(0 if has_token else 1).setChecked(True)
+        self._cert_keys = [o[0] for o in opts]
+        lay.addStretch()
+        wz.addPage(p)
+
+        # 6. Foundry download (last, because the timed link expires)
+        self.source = QtWidgets.QLineEdit()
+        self.source.setPlaceholderText("https://… timed link, or pick a .zip file")
+        pick = QtWidgets.QPushButton("Zip file…")
+        pick.clicked.connect(self._pick)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.source)
+        row.addWidget(pick)
+
+        def check_source():
+            s = self.source.text().strip()
+            if not s:
+                return "Paste the timed download link, or pick the zip."
+            if not re.match(r"https?://", s) and not Path(s).is_file():
+                return f"Can't find the file {s}."
+            return ""
+        p = CheckedPage("Foundry download", "The Node.js version of Foundry, from your account.", check_source)
+        p.lay.addWidget(explain(
+            "<p>Foundry is only downloadable from your account, so the tool needs a link or the file:</p><ol>"
+            "<li>Sign in at <a href='https://foundryvtt.com'>foundryvtt.com</a> and open "
+            "<b>Purchased Licenses</b>.</li>"
+            "<li>Pick the version you want and the <b>Node.js</b> operating system.</li>"
+            "<li>Click <b>Timed URL</b> to copy a download link, and paste it below. "
+            "Or click <b>Download</b> and pick the zip with the button.</li></ol>"
+            "<p>The timed link stops working after a few minutes, which is why this is the last question. "
+            "Use the same Foundry version as your other server if your worlds should move between them.</p>"))
+        form = QtWidgets.QFormLayout()
+        form.addRow("Download:", row)
+        p.lay.addLayout(form)
+        p.lay.addStretch()
+        wz.addPage(p)
+
+        # 7. Summary
+        self.summary = explain("")
+        p, lay = page("Ready to create", "Check the details. Back changes them.")
+        lay.addWidget(self.summary)
+        lay.addStretch()
+        p.initializePage = self._fill_summary
+        wz.addPage(p)
+        wz.setButtonText(QtWidgets.QWizard.FinishButton, "Create server")
 
     def _names(self, text):
         n = re.sub(r"[^A-Za-z0-9_-]", "", text) or "foundry2"
@@ -481,31 +955,36 @@ class AddDialog(QtWidgets.QDialog):
         self.data_dir.setText(f"{self.home}/{n.replace('foundry', 'foundrydata', 1) if n.startswith('foundry') else n + '-data'}")
 
     def _pick(self):
-        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Foundry Node.js zip", str(Path.home() / "Downloads"), "Zip files (*.zip)")
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self.w, "Foundry Node.js zip", str(Path.home() / "Downloads"), "Zip files (*.zip)")
         if f:
             self.source.setText(f)
 
-    def _check(self):
-        problems = []
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.name.text()):
-            problems.append("Name: letters, digits, - and _ only.")
-        if not re.fullmatch(r"(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,}", self.fqdn.text().strip().lower()):
-            problems.append("Address: a full domain name such as second.example.com.")
-        if not self.source.text().strip():
-            problems.append("Foundry download: paste the timed link or pick the zip.")
-        if not port_free(self.port.value()):
-            problems.append(f"Port {self.port.value()} is in use.")
-        if problems:
-            QtWidgets.QMessageBox.warning(self, APP, "\n".join(problems))
-            return
-        self.accept()
+    def _fill_summary(self):
+        v = self.values()
+        cert = {"cloudflare": "Let's Encrypt, checked through Cloudflare DNS",
+                "nginx": "Let's Encrypt, checked over HTTP", "skip": "skipped: you'll add one"}[v["cert"]]
+        dns = (f"CNAME to {self.settings['existing_domain']}" + (", proxied" if v["proxied"] else ", DNS only")
+               if v["dns"] else "you add it yourself")
+        src = "timed link" if re.match(r"https?://", v["source"]) else v["source"]
+        rows = [("Name", v["name"]), ("Address", f"https://{v['fqdn']}"), ("DNS record", dns),
+                ("Port", v["port"]), ("Install folder", v["app_dir"]), ("Data folder", v["data_dir"]),
+                ("Certificate", cert), ("Foundry from", src), ("Runs as", self.settings["foundry_user"])]
+        self.summary.setText(
+            "<table cellspacing='6'>" + "".join(f"<tr><td><b>{k}</b></td><td>{val}</td></tr>" for k, val in rows)
+            + "</table><p>Create server asks for your sudo password (if it hasn't yet), then shows each step "
+            "as it runs. If a step fails, it stops there and says why; the steps before it stay done.</p>"
+            f"<p>Afterwards, open https://{v['fqdn']}, enter your licence key and set an admin password.</p>")
+
+    def exec(self) -> bool:
+        return bool(self.w.exec())
 
     def values(self) -> dict:
         return {
             "name": self.name.text().strip(), "fqdn": self.fqdn.text().strip().lower(), "port": self.port.value(),
             "app_dir": self.app_dir.text().strip(), "data_dir": self.data_dir.text().strip(),
-            "source": self.source.text().strip(), "dns": self.dns.isChecked(), "proxied": self.proxied.isChecked(),
-            "cert": ["cloudflare", "nginx", "skip"][self.cert.currentIndex()],
+            "source": self.source.text().strip(), "dns": self.dns.isChecked() and self.dns.isEnabled(),
+            "proxied": self.proxied.isChecked(),
+            "cert": self._cert_keys[self.cert.checkedId()],
         }
 
 
@@ -554,7 +1033,8 @@ class Main(QtWidgets.QMainWindow):
         act("Add server…", "list-add", self.add_server)
         act("Remove…", "list-remove", self.remove_server)
         tb.addSeparator()
-        act("Settings…", "configure", self.edit_settings)
+        act("Settings…", "configure", self.edit_settings, "Change the answers from setup")
+        act("Setup guide…", "help-contents", self.run_setup, "Go through setup again, step by step")
 
         self.status = self.statusBar()
         self.timer = QtCore.QTimer(self, interval=15000, timeout=self.update_status)
@@ -682,6 +1162,15 @@ class Main(QtWidgets.QMainWindow):
                 save_cloudflare_token(token)
             self.refresh()
 
+    def run_setup(self):
+        wz = SetupWizard(self, self.settings)
+        if wz.exec():
+            self.settings, token = wz.values()
+            save_settings(self.settings)
+            if token != cloudflare_token():
+                save_cloudflare_token(token)
+            self.refresh()
+
     # ---- nginx folder ------------------------------------------------------------
     def nginx_dir(self, log) -> str | None:
         if self.settings.get("nginx_dir"):
@@ -707,7 +1196,7 @@ class Main(QtWidgets.QMainWindow):
 
     # ---- add a server ------------------------------------------------------------
     def add_server(self):
-        dlg = AddDialog(self, self.settings, {s.port for s in self.servers}, self.home())
+        dlg = AddWizard(self, self.settings, {s.port for s in self.servers}, self.home())
         if not dlg.exec():
             return
         v = dlg.values()
@@ -912,7 +1401,7 @@ def main():
         save_settings(settings)
     # First run: ask which user runs Foundry (suggesting the ones running it).
     if not settings["foundry_user"]:
-        dlg = SettingsDialog(None, settings, first_run=True)
+        dlg = SetupWizard(None, settings)
         if not dlg.exec():
             return
         settings, token = dlg.values()
