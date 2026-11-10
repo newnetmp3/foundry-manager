@@ -5,14 +5,13 @@ Lists the Foundry servers pm2 runs for the Foundry user (status, address,
 port, people connected), starts/stops/restarts them, shows their logs, and adds
 new ones: install folder and data folder, the Foundry Node.js build (timed
 download link or a zip), options.json, a pm2 process, a Cloudflare DNS record,
-a Let's Encrypt certificate, and an nginx site.
+and a Caddy site (Caddy gets the HTTPS certificate itself).
 
 Runs as your desktop user. Commands for the Foundry user go through
-`sudo -u <user>`; nginx and certbot through `sudo`. Your sudo password is
+`sudo -u <user>`; Caddy and systemctl through `sudo`. Your sudo password is
 asked once and kept only in memory for this session.
 
-Needs: python-pyside6, nginx, certbot (+ certbot-dns-cloudflare to get
-certificates through Cloudflare DNS), and pm2 for the Foundry user.
+Needs: python-pyside6, caddy, curl, unzip, and pm2 for the Foundry user.
 """
 from __future__ import annotations
 
@@ -34,17 +33,16 @@ from PySide6 import QtCore, QtGui, QtWidgets
 APP = "Foundry Server Manager"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "foundry-manager"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
-CF_CREDENTIALS = CONFIG_DIR / "cloudflare.ini"  # certbot-dns-cloudflare format, mode 600
+CF_CREDENTIALS = CONFIG_DIR / "cloudflare.ini"  # the Cloudflare API token, mode 600
 MARKER = "# Written by Foundry Server Manager"
 
 DEFAULTS = {
     "foundry_user": "",      # asked on first run (or --user NAME)
     "existing_domain": "",   # found from that user's running server
     "cloudflare_zone": "",   # the existing address's domain
-    "letsencrypt_email": "",
-    "nginx_dir": "",  # found from the existing site when empty
-    "web_server": "",  # "caddy" or "nginx"; empty: whichever is running
+    "caddyfile": "",         # empty: /etc/caddy/Caddyfile
 }
+OLD_SETTINGS = ("letsencrypt_email", "nginx_dir", "web_server")  # from the nginx days
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +53,7 @@ def load_settings() -> dict:
         data = json.loads(SETTINGS_FILE.read_text())
     except (OSError, ValueError):
         data = {}
-    return {**DEFAULTS, **data}
+    return {**DEFAULTS, **{k: v for k, v in data.items() if k not in OLD_SETTINGS}}
 
 
 def save_settings(s: dict) -> None:
@@ -241,46 +239,6 @@ def port_free(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) != 0
 
 
-def site_dirs(conf: str) -> list[str]:
-    """Folders that nginx.conf includes *directly inside http { }* with a wildcard (where site files go).
-
-    Folders included elsewhere (top-level modules.d for load_module, snippets inside server blocks)
-    don't take site files. Relative paths are relative to /etc/nginx.
-    """
-    text = re.sub(r"#[^\n]*", "", conf)
-    stack, buf, found = [], "", []
-    for ch in text:
-        if ch not in "{};":
-            buf += ch
-            continue
-        stmt = buf.strip()
-        buf = ""
-        if ch == "{":
-            stack.append(stmt.split()[0] if stmt else "")
-        elif ch == "}":
-            if stack:
-                stack.pop()
-        elif stack == ["http"] and re.match(r"include\s", stmt):
-            path = stmt.split(None, 1)[1].strip().strip("'\"")
-            if "*" not in Path(path).name or "mime" in path:
-                continue
-            d = str((Path("/etc/nginx") / path).parent)
-            if d not in found:
-                found.append(d)
-    # Prefer the usual site folders.
-    rank = lambda d: 0 if d.endswith("sites-enabled") else 1 if d.endswith("conf.d") else 2
-    return sorted(found, key=rank)
-
-
-def add_sites_include(conf: str) -> str | None:
-    """nginx.conf with `include sites-enabled/*.conf;` added at the start of the http block."""
-    m = re.search(r"^(\s*)http\s*\{[^\n]*\n", conf, re.M)
-    if not m:
-        return None
-    line = f"{m.group(1)}    include sites-enabled/*.conf;  {MARKER}\n"
-    return conf[: m.end()] + line + conf[m.end():]
-
-
 CADDYFILE = "/etc/caddy/Caddyfile"
 
 
@@ -336,45 +294,6 @@ def caddy_site(name: str, fqdn: str, port: int, existing_text: str = "", existin
                 break
     return "\n".join([f"{MARKER}: {name}", f"# Foundry VTT at https://{fqdn} -> port {port}",
                       f"{fqdn} {{", *body, "}", ""])
-
-
-def nginx_site(name: str, fqdn: str, port: int) -> str:
-    return f"""{MARKER}: {name}
-# Foundry VTT at https://{fqdn} -> 127.0.0.1:{port}
-server {{
-    listen 80;
-    listen [::]:80;
-    server_name {fqdn};
-    return 301 https://$host$request_uri;
-}}
-
-server {{
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
-    server_name {fqdn};
-
-    ssl_certificate /etc/letsencrypt/live/{fqdn}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/{fqdn}/privkey.pem;
-
-    client_max_body_size 300M;
-
-    location / {{
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # Foundry needs WebSockets.
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "Upgrade";
-        proxy_read_timeout 90s;
-
-        proxy_pass http://127.0.0.1:{port};
-    }}
-}}
-"""
 
 
 def foundry_options(fqdn: str, port: int, existing: dict | None = None) -> dict:
@@ -484,13 +403,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.domain.textEdited.connect(lambda t: self.zone.setText(zone_of(t)) if not self._zone_edited else None)
         self._zone_edited = bool(settings["cloudflare_zone"])
         self.zone.textEdited.connect(lambda _t: setattr(self, "_zone_edited", True))
-        self.email = QtWidgets.QLineEdit(settings["letsencrypt_email"])
         self._orig = dict(settings)
-        self.web = QtWidgets.QComboBox()
-        self.web.addItems(["Automatic (whichever is running)", "Caddy", "nginx"])
-        self.web.setCurrentIndex({"caddy": 1, "nginx": 2}.get(settings.get("web_server") or "", 0))
-        self.nginx = QtWidgets.QLineEdit(settings["nginx_dir"])
-        self.nginx.setPlaceholderText("found from your existing site")
+        self.caddyfile = QtWidgets.QLineEdit(settings["caddyfile"])
+        self.caddyfile.setPlaceholderText(CADDYFILE)
         self.token = QtWidgets.QLineEdit(cloudflare_token())
         self.token.setEchoMode(QtWidgets.QLineEdit.Password)
         self.token.setPlaceholderText("API token with Zone › DNS › Edit")
@@ -498,9 +413,7 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow("Existing server address:", self.domain)
         form.addRow("Cloudflare zone (domain):", self.zone)
         form.addRow("Cloudflare API token:", self.token)
-        form.addRow("Let's Encrypt email:", self.email)
-        form.addRow("Web server:", self.web)
-        form.addRow("nginx sites folder:", self.nginx)
+        form.addRow("Caddyfile:", self.caddyfile)
         hint = QtWidgets.QLabel(
             "The token is stored in ~/.config/foundry-manager/cloudflare.ini (only you can read it).\n"
             "Create one at dash.cloudflare.com → My Profile → API Tokens → Edit zone DNS.")
@@ -529,10 +442,9 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def values(self) -> tuple[dict, str]:
         return ({
-            **self._orig, "web_server": ["", "caddy", "nginx"][self.web.currentIndex()],
+            **self._orig,
             "foundry_user": self.user.currentText().strip(), "existing_domain": self.domain.text().strip(),
-            "cloudflare_zone": self.zone.text().strip(), "letsencrypt_email": self.email.text().strip(),
-            "nginx_dir": self.nginx.text().strip(),
+            "cloudflare_zone": self.zone.text().strip(), "caddyfile": self.caddyfile.text().strip(),
         }, self.token.text().strip())
 
 
@@ -636,15 +548,15 @@ class SetupWizard:
         lay.addWidget(explain(
             "<p>This tool runs and adds <b>Foundry VTT</b> servers (the Node.js version) on this machine. "
             "Each server gets its own web address, port, install folder and data folder, and is kept running by "
-            "<b>pm2</b>. nginx puts them on the web with HTTPS.</p>"
+            "<b>pm2</b>. <b>Caddy</b> puts them on the web with HTTPS.</p>"
             "<p>The next pages ask:</p><ol>"
             "<li>Which system user runs Foundry.</li>"
             "<li>The address of the server you already have (if any).</li>"
             "<li>Your Cloudflare details, if your DNS is on Cloudflare (optional).</li>"
-            "<li>An email for certificate notices (optional).</li></ol>"
+            "<li>Where your Caddyfile is (usually found by itself).</li></ol>"
             "<p>Nothing on the system changes during setup: answers are only saved to "
             f"<code>{SETTINGS_FILE}</code>. You can change them later under <b>Settings</b>.</p>"
-            "<p>Later, when the tool needs to change something (start a server, write an nginx site), it asks for "
+            "<p>Later, when the tool needs to change something (start a server, add a Caddy site), it asks for "
             "your <b>sudo password</b> once and keeps it in memory only until you close it.</p>"))
         lay.addStretch()
         wz.addPage(p)
@@ -697,8 +609,8 @@ class SetupWizard:
             "<p>It's used in two ways when you add a server:</p><ul>"
             "<li><b>DNS:</b> the new address (say <code>second.example.com</code>) is pointed at this one "
             "with a CNAME record, so it reaches the same machine without you looking up its IP.</li>"
-            "<li><b>nginx:</b> the new site file goes in the same folder as this address's site file, "
-            "so nginx loads it the same way.</li></ul>"
+            "<li><b>Caddy:</b> the new site copies this address's site block in your Caddyfile (where it "
+            "forwards to, compression and so on), with only the address and port changed.</li></ul>"
             "<p>No server yet? Leave it empty: new servers still install, and you add their DNS record "
             "yourself.</p>"))
         form = QtWidgets.QFormLayout()
@@ -726,12 +638,11 @@ class SetupWizard:
             if self.token.text().strip() and not self.zone.text().strip():
                 return "With a token, also enter the Cloudflare zone (your domain, like example.com)."
             return ""
-        p = CheckedPage("Cloudflare (optional)", "Lets the tool create DNS records and certificates for you.", check_cf)
+        p = CheckedPage("Cloudflare (optional)", "Lets the tool create DNS records for you.", check_cf)
         p.lay.addWidget(explain(
-            "<p>If your domain's DNS is on Cloudflare, an <b>API token</b> lets this tool:</p><ul>"
-            "<li>add the DNS record for each new server's address, and</li>"
-            "<li>get its HTTPS certificate from Let's Encrypt by proving you own the domain through DNS, "
-            "which works even with Cloudflare's proxy (orange cloud) on.</li></ul>"
+            "<p>If your domain's DNS is on Cloudflare, an <b>API token</b> lets this tool add the DNS record "
+            "for each new server's address, so the address leads to this machine. (Caddy handles the HTTPS "
+            "certificate on its own.)</p>"
             "<p><b>Zone</b> is the domain as Cloudflare lists it, for example <code>example.com</code>.</p>"
             "<p><b>To make a token:</b> <a href='https://dash.cloudflare.com/profile/api-tokens'>"
             "dash.cloudflare.com → My Profile → API Tokens</a> → Create Token → use the "
@@ -744,48 +655,37 @@ class SetupWizard:
         p.lay.addWidget(self.token_result)
         p.lay.addWidget(note(
             f"The token is saved in {CF_CREDENTIALS}, readable only by you. Not on Cloudflare? Leave both empty "
-            "and Next: you'll add DNS records yourself, and certificates are checked over HTTP instead."))
+            "and Next: you'll add DNS records yourself."))
         p.lay.addStretch()
         p.initializePage = lambda: self.zone.text() or self.zone.setText(zone_of(self.domain.text()))
         wz.addPage(p)
 
-        # 5. Web server and certificates
-        self.email = QtWidgets.QLineEdit(settings["letsencrypt_email"])
-        self.email.setPlaceholderText("you@example.com (optional)")
-        self.nginx = QtWidgets.QLineEdit(settings["nginx_dir"])
-        self.nginx.setPlaceholderText("leave empty to find it automatically")
+        # 5. Caddy
+        self.caddyfile = QtWidgets.QLineEdit(settings["caddyfile"])
+        self.caddyfile.setPlaceholderText(CADDYFILE)
+        self.caddy_note = note("")
 
-        def check_email():
-            e = self.email.text().strip()
-            if e and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", e):
-                return "That doesn't look like an email address (or leave it empty)."
+        def check_caddy():
+            f = self.caddyfile.text().strip()
+            if f and not f.startswith("/"):
+                return "Enter the Caddyfile's full path, starting with /, or leave it empty for " + CADDYFILE + "."
             return ""
-        p = CheckedPage("Web server and certificates", "Optional: the defaults work for most setups.", check_email)
+        p = CheckedPage("Caddy", "The web server that puts your Foundry servers on the internet.", check_caddy)
         p.lay.addWidget(explain(
-            "<p><b>Web server.</b> Caddy or nginx puts your servers on the web with HTTPS. The tool uses whichever "
-            "is running. With <b>Caddy</b>, new sites copy your existing site's settings and Caddy gets "
-            "certificates itself, so the rest of this page doesn't apply.</p>"))
+            "<p><b>Caddy</b> takes visits to each server's address on the normal web ports and forwards them to "
+            "that server's port on this machine. It gets and renews the HTTPS certificate for every address by "
+            "itself, so there's no certificate step.</p>"
+            "<p>For each new server, the tool adds a site to Caddy that copies your existing site's block, "
+            "checks the configuration with <code>caddy validate</code>, and reloads Caddy. It never edits a site "
+            "it didn't write.</p>"
+            f"<p><b>Caddyfile.</b> Leave empty to use <code>{CADDYFILE}</code>, where Caddy keeps it on most "
+            "systems. Only fill this in if yours is somewhere else.</p>"))
         form = QtWidgets.QFormLayout()
-        self.web = QtWidgets.QComboBox()
-        self.web.addItems(["Automatic (whichever is running)", "Caddy", "nginx"])
-        self.web.setCurrentIndex({"caddy": 1, "nginx": 2}.get(settings.get("web_server") or "", 0))
-        form.addRow("Web server:", self.web)
+        form.addRow("Caddyfile:", self.caddyfile)
         p.lay.addLayout(form)
-        p.lay.addWidget(explain(
-            "<p><b>Let's Encrypt email.</b> Each server's address gets a free HTTPS certificate from Let's "
-            "Encrypt. They renew on their own; this email only gets a warning if a renewal keeps failing. "
-            "It isn't shared or used for anything else. Empty is fine.</p>"))
-        form = QtWidgets.QFormLayout()
-        form.addRow("Let's Encrypt email:", self.email)
-        p.lay.addLayout(form)
-        p.lay.addWidget(explain(
-            "<p><b>nginx sites folder.</b> Where new site files go. Left empty, the tool uses the folder of your "
-            "existing server's site, or the folder your <code>nginx.conf</code> includes "
-            "(such as <code>/etc/nginx/sites-available</code>). Only fill this in if that guesses wrong.</p>"))
-        form = QtWidgets.QFormLayout()
-        form.addRow("nginx sites folder:", self.nginx)
-        p.lay.addLayout(form)
+        p.lay.addWidget(self.caddy_note)
         p.lay.addStretch()
+        p.initializePage = self._check_caddy
         wz.addPage(p)
 
         # 6. Summary
@@ -810,6 +710,17 @@ class SetupWizard:
             self.domain_note.setText("Couldn't read it from the running server (it may belong to another user). "
                                      "It's filled in automatically the first time the server list loads, "
                                      "or type it here.")
+
+    def _check_caddy(self):
+        installed = shutil.which("caddy")
+        conf = Path(self.caddyfile.text().strip() or CADDYFILE)
+        if not installed:
+            self.caddy_note.setText("Caddy doesn't seem to be installed here. Install it before adding a server: "
+                                    "<code>sudo pacman -S caddy</code>, then <code>sudo systemctl enable --now caddy</code>.")
+        elif not conf.exists():
+            self.caddy_note.setText(f"There's no file at {conf}. If Caddy uses a different Caddyfile, enter it here.")
+        else:
+            self.caddy_note.setText(f"✓ Caddy is installed and {conf} exists.")
 
     def _test_token(self):
         token, zone = self.token.text().strip(), self.zone.text().strip()
@@ -843,8 +754,7 @@ class SetupWizard:
             + row("Existing address", v["existing_domain"], "none: you'll add DNS records yourself")
             + row("Cloudflare zone", v["cloudflare_zone"], "none")
             + row("Cloudflare token", "saved (hidden)" if token else "", "none: no automatic DNS")
-            + row("Let's Encrypt email", v["letsencrypt_email"], "none")
-            + row("nginx sites folder", v["nginx_dir"], "found automatically")
+            + row("Caddyfile", v["caddyfile"], CADDYFILE)
             + "</table><p>After saving, the main window lists the servers pm2 runs for "
             f"<b>{v['foundry_user']}</b>. Use <b>Add server…</b> to set up another one; it walks you through it "
             "the same way.</p>")
@@ -855,22 +765,19 @@ class SetupWizard:
     def values(self) -> tuple[dict, str]:
         return ({
             **self.settings,
-            "web_server": ["", "caddy", "nginx"][self.web.currentIndex()],
             "foundry_user": self.user.currentText().strip(),
             "existing_domain": self.domain.text().strip().lower(),
             "cloudflare_zone": self.zone.text().strip().lower(),
-            "letsencrypt_email": self.email.text().strip(),
-            "nginx_dir": self.nginx.text().strip(),
+            "caddyfile": self.caddyfile.text().strip(),
         }, self.token.text().strip())
 
 
 class AddWizard:
     """Adding a server, one decision per page, each with the reason it's asked."""
 
-    def __init__(self, parent, settings: dict, used_ports: set[int], home: str, web: str = "nginx"):
+    def __init__(self, parent, settings: dict, used_ports: set[int], home: str):
         self.settings = settings
         self.home = home
-        self.web = web
         self.w = wz = wizard(parent, "Add a Foundry server")
         has_token = bool(cloudflare_token())
         target = settings["existing_domain"]
@@ -890,12 +797,9 @@ class AddWizard:
             "<li>downloads and unpacks Foundry,</li>"
             "<li>writes Foundry's <code>options.json</code> (port and address),</li>"
             "<li>starts it under pm2 so it runs after reboots,</li>"
-            "<li>adds the DNS record (if you choose),</li>"
-            + ("<li>adds a Caddy site for the address, copied from your existing site's settings; Caddy gets "
-               "the HTTPS certificate itself.</li></ol>" if web == "caddy" else
-               "<li>gets an HTTPS certificate, and</li>"
-               "<li>adds an nginx site that forwards the address to the server.</li></ol>")
-            + 
+            "<li>adds the DNS record (if you choose), and</li>"
+            "<li>adds a Caddy site for the address, copied from your existing site's settings. Caddy gets "
+            "the HTTPS certificate itself.</li></ol>"
             "<p>Nothing changes until that last click, and your existing servers aren't touched.</p>"))
         lay.addStretch()
         wz.addPage(p)
@@ -917,14 +821,14 @@ class AddWizard:
         p = CheckedPage("Name and address", "How you and your players will tell this server apart.", check_name)
         p.lay.addWidget(explain(
             "<p><b>Name</b> is what pm2 calls the server (you'll see it in the list and in <code>pm2 list</code>). "
-            "It also names its folders and its nginx file. Short and without spaces, like <code>foundry2</code>.</p>"))
+            "It also names its folders and its Caddy site file. Short and without spaces, like <code>foundry2</code>.</p>"))
         form = QtWidgets.QFormLayout()
         form.addRow("Name:", self.name)
         p.lay.addLayout(form)
         p.lay.addWidget(explain(
             "<p><b>Address</b> is the web address players open, so it must be one you own: a new subdomain "
-            "of your domain is easiest. It has to differ from your existing server's address, because the web server "
-            f"uses the address to tell which server a visitor wants.</p>"))
+            "of your domain is easiest. It has to differ from your existing server's address, because Caddy "
+            "uses the address to tell which server a visitor wants.</p>"))
         form = QtWidgets.QFormLayout()
         form.addRow("Address:", self.fqdn)
         p.lay.addLayout(form)
@@ -957,8 +861,8 @@ class AddWizard:
             if not has_token:
                 self.dns_note.setText("No Cloudflare token is saved (Settings), so add this record yourself in your "
                                       f"DNS provider: CNAME <b>{fq}</b> → <b>{target or 'this machine'}</b> "
-                                      "(or an A record with this machine's IP). Do it before Create, so the "
-                                      "certificate step can find the address.")
+                                      "(or an A record with this machine's IP). Caddy can only get the HTTPS "
+                                      "certificate once the address leads here.")
             elif not target:
                 self.dns_note.setText("There's no existing server address in Settings to point at, so add the "
                                       f"record for <b>{fq}</b> yourself (an A record with this machine's IP).")
@@ -994,7 +898,7 @@ class AddWizard:
         p = CheckedPage("Port and folders", "Where the server listens, and where its files go.", check_where)
         p.lay.addWidget(explain(
             "<p><b>Port.</b> Every Foundry server on the machine needs its own port; your first one usually has "
-            f"30000. Players never see it: {web.capitalize()} takes visits to the address on the normal HTTPS port and "
+            "30000. Players never see it: Caddy takes visits to the address on the normal HTTPS port and "
             "forwards them here. The first free one is filled in.</p>"))
         form = QtWidgets.QFormLayout()
         form.addRow("Port:", self.port)
@@ -1011,51 +915,7 @@ class AddWizard:
         p.lay.addStretch()
         wz.addPage(p)
 
-        # 5. HTTPS certificate
-        self.cert = QtWidgets.QButtonGroup(wz)
-        opts = [
-            ("cloudflare", "Through Cloudflare DNS (recommended with Cloudflare)",
-             "certbot proves you own the domain by adding a temporary DNS record with your token. Works with the "
-             "orange cloud on." + ("" if has_token else " <i>Needs a Cloudflare token in Settings.</i>")),
-            ("nginx", "Through nginx (HTTP check)",
-             "Let's Encrypt visits the address over plain HTTP to check it reaches this machine. Needs the DNS "
-             "record in place and port 80 open from the internet."),
-            ("skip", "Skip: I'll add a certificate myself",
-             "The nginx site expects one at /etc/letsencrypt/live/&lt;address&gt;/; nginx won't load the site "
-             "until it's there."),
-        ]
-        p, lay = page("HTTPS certificate", "So browsers connect securely and show the padlock.")
-        if web == "caddy":
-            lay.addWidget(explain(
-                "<p>Your web server is <b>Caddy</b>, which gets and renews HTTPS certificates by itself, the same "
-                "way it does for your existing site. There's nothing to choose here.</p>"
-                "<p>The new site copies your existing site's Caddy settings (such as compression and where it "
-                "forwards to), with only the address and port changed.</p>"))
-        lay.addWidget(explain(
-            "<p>Browsers need a certificate for the new address before they'll connect over HTTPS. "
-            "<b>Let's Encrypt</b> gives them free, and certbot renews them automatically. First it has to "
-            "check that you control the address. Choose how:</p>"))
-        for i, (key, label, why) in enumerate(opts):
-            rb = QtWidgets.QRadioButton(label)
-            self.cert.addButton(rb, i)
-            lay.addWidget(rb)
-            hint = note(why)
-            hint.setContentsMargins(24, 0, 0, 6)
-            lay.addWidget(hint)
-            if key == "cloudflare" and not has_token:
-                rb.setEnabled(False)
-        self.cert.button(0 if has_token else 1).setChecked(True)
-        self._cert_keys = [o[0] for o in opts]
-        if web == "caddy":
-            # Only the explanation above: hide the certbot choices.
-            for i in range(lay.count() - 1, 0, -1):
-                item = lay.itemAt(i).widget()
-                if item:
-                    item.hide()
-        lay.addStretch()
-        wz.addPage(p)
-
-        # 6. Foundry download (last, because the timed link expires)
+        # 5. Foundry download (last, because the timed link expires)
         self.source = QtWidgets.QLineEdit()
         self.source.setPlaceholderText("https://… timed link, or pick a .zip file")
         pick = QtWidgets.QPushButton("Zip file…")
@@ -1087,7 +947,7 @@ class AddWizard:
         p.lay.addStretch()
         wz.addPage(p)
 
-        # 7. Summary
+        # 6. Summary
         self.summary = explain("")
         p, lay = page("Ready to create", "Check the details. Back changes them.")
         lay.addWidget(self.summary)
@@ -1108,14 +968,12 @@ class AddWizard:
 
     def _fill_summary(self):
         v = self.values()
-        cert = {"cloudflare": "Let's Encrypt, checked through Cloudflare DNS", "caddy": "Caddy gets it itself",
-                "nginx": "Let's Encrypt, checked over HTTP", "skip": "skipped: you'll add one"}[v["cert"]]
         dns = (f"CNAME to {self.settings['existing_domain']}" + (", proxied" if v["proxied"] else ", DNS only")
                if v["dns"] else "you add it yourself")
         src = "timed link" if re.match(r"https?://", v["source"]) else v["source"]
         rows = [("Name", v["name"]), ("Address", f"https://{v['fqdn']}"), ("DNS record", dns),
                 ("Port", v["port"]), ("Install folder", v["app_dir"]), ("Data folder", v["data_dir"]),
-                ("Certificate", cert), ("Foundry from", src), ("Runs as", self.settings["foundry_user"])]
+                ("HTTPS", "Caddy gets the certificate"), ("Foundry from", src), ("Runs as", self.settings["foundry_user"])]
         self.summary.setText(
             "<table cellspacing='6'>" + "".join(f"<tr><td><b>{k}</b></td><td>{val}</td></tr>" for k, val in rows)
             + "</table><p>Create server asks for your sudo password (if it hasn't yet), then shows each step "
@@ -1131,7 +989,6 @@ class AddWizard:
             "app_dir": self.app_dir.text().strip(), "data_dir": self.data_dir.text().strip(),
             "source": self.source.text().strip(), "dns": self.dns.isChecked() and self.dns.isEnabled(),
             "proxied": self.proxied.isChecked(),
-            "cert": "caddy" if self.web == "caddy" else self._cert_keys[self.cert.checkedId()],
         }
 
 
@@ -1179,7 +1036,7 @@ class Main(QtWidgets.QMainWindow):
         tb.addSeparator()
         act("Add server…", "list-add", self.add_server)
         act("Set up web access…", "network-server", self.finish_web,
-            "Certificate and nginx site for the selected server (if adding it stopped before those)")
+            "Caddy site for the selected server (if adding it stopped before that step)")
         act("Remove…", "list-remove", self.remove_server)
         tb.addSeparator()
         act("Settings…", "configure", self.edit_settings, "Change the answers from setup")
@@ -1342,20 +1199,7 @@ class Main(QtWidgets.QMainWindow):
                 save_cloudflare_token(token)
             self.refresh()
 
-    # ---- nginx folder ------------------------------------------------------------
-    def web_server(self) -> str:
-        """caddy or nginx: the setting, else whichever is running, else whichever is installed."""
-        pref = self.settings.get("web_server") or ""
-        if pref in ("caddy", "nginx"):
-            return pref
-        for name in ("caddy", "nginx"):
-            try:
-                if subprocess.run(["systemctl", "is-active", "--quiet", name], timeout=10).returncode == 0:
-                    return name
-            except (OSError, subprocess.SubprocessError):
-                pass
-        return "caddy" if shutil.which("caddy") and not shutil.which("nginx") else "nginx"
-
+    # ---- Caddy ---------------------------------------------------------------------
     def caddy_steps(self, v) -> list:
         """Caddy site for v = {name, fqdn, port}. Caddy gets the HTTPS certificate itself."""
         R = self.runner
@@ -1417,59 +1261,13 @@ class Main(QtWidgets.QMainWindow):
             return code == 0
         return [("Caddy site", caddy)]
 
-    def nginx_dir(self, log) -> str | None:
-        """The folder nginx loads site files from (inside its http block)."""
-        if self.settings.get("nginx_dir"):
-            return str(Path("/etc/nginx") / self.settings["nginx_dir"])
-        R = self.runner
-        code, conf = R.run(["cat", "/etc/nginx/nginx.conf"], root=True)
-        if code != 0:
-            log("Couldn't read /etc/nginx/nginx.conf: is nginx installed?")
-            return None
-        dirs = site_dirs(conf)
-        def available(d):
-            # Sites in sites-enabled are usually links to files in sites-available.
-            if d.endswith("/sites-enabled"):
-                alt = d[: -len("enabled")] + "available"
-                if R.run(["test", "-d", alt], root=True)[0] == 0:
-                    return alt
-            return d
-        # Next to the existing site, if it's in one of those folders.
-        if self.settings["existing_domain"] and dirs:
-            dom = re.escape(self.settings["existing_domain"])
-            code, out = R.run(["grep", "-rlE", f"server_name[^;]*{dom}", "/etc/nginx"], root=True)
-            for f in [x.strip() for x in out.splitlines() if x.strip()]:
-                parent = str(Path(f).parent)
-                if parent in dirs or parent in [available(d) for d in dirs]:
-                    log(f"Your existing site is in {f}; the new one goes next to it.")
-                    return parent
-        if dirs:
-            d = available(dirs[0])
-            log(f"nginx loads sites from {dirs[0]}; the new site goes in {d}.")
-            return d
-        # nginx.conf includes no folder of sites: add the usual one.
-        log("nginx.conf doesn't load a folder of site files, so the tool adds the usual one: "
-            "/etc/nginx/sites-enabled (with sites-available). A backup of nginx.conf is kept as "
-            "/etc/nginx/nginx.conf.foundry-manager.bak.")
-        patched = add_sites_include(conf)
-        if patched is None:
-            log("Couldn't find the http { block in nginx.conf: set the nginx sites folder in Settings.")
-            return None
-        R.run(["mkdir", "-p", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled"], root=True)
-        R.run(["cp", "-n", "/etc/nginx/nginx.conf", "/etc/nginx/nginx.conf.foundry-manager.bak"], root=True)
-        code, out = R.write_file("/etc/nginx/nginx.conf", patched, root=True)
-        if code != 0:
-            log(out)
-            return None
-        return "/etc/nginx/sites-available"
-
     # ---- add a server ------------------------------------------------------------
     def add_server(self):
-        dlg = AddWizard(self, self.settings, {s.port for s in self.servers}, self.home(), self.web_server())
+        dlg = AddWizard(self, self.settings, {s.port for s in self.servers}, self.home())
         if not dlg.exec():
             return
         v = dlg.values()
-        if not self.check_programs(v):
+        if not self.check_programs():
             return
         u = self.user
         R = self.runner
@@ -1551,7 +1349,7 @@ class Main(QtWidgets.QMainWindow):
         ]
         if v["dns"]:
             steps.append(("Cloudflare DNS record", dns))
-        steps += self.web_steps(v)
+        steps += self.caddy_steps(v)
 
         def done(ok):
             if ok:
@@ -1562,18 +1360,9 @@ class Main(QtWidgets.QMainWindow):
                     + ("\n\nDNS can take a minute to reach everyone." if v["dns"] else ""))
         self.run_steps(f"Adding {v['name']}", steps, done)
 
-    def check_programs(self, v) -> bool:
+    def check_programs(self, need=("curl", "unzip", "caddy")) -> bool:
         """Before changing anything: are the programs the steps use installed?"""
-        caddy = self.web_server() == "caddy"
-        need = [("curl", "curl"), ("unzip", "unzip"), ("caddy", "caddy") if caddy else ("nginx", "nginx")]
-        if v["cert"] != "skip" and not caddy:
-            need.append(("certbot", "certbot"))
-        missing = sorted({pkg for cmd, pkg in need if not shutil.which(cmd)})
-        import importlib.util
-        plugin = {"cloudflare": ("certbot_dns_cloudflare", "certbot-dns-cloudflare"),
-                  "nginx": ("certbot_nginx", "certbot-nginx")}.get(v["cert"]) if not caddy else None
-        if plugin and not importlib.util.find_spec(plugin[0]):
-            missing.append(plugin[1])
+        missing = [cmd for cmd in need if not shutil.which(cmd)]
         if not missing:
             return True
         box = QtWidgets.QMessageBox(self)
@@ -1587,68 +1376,6 @@ class Main(QtWidgets.QMainWindow):
         box.button(QtWidgets.QMessageBox.Ignore).setText("Continue anyway")
         return box.exec() == QtWidgets.QMessageBox.Ignore
 
-    def web_steps(self, v) -> list:
-        """Certificate and nginx site for v = {name, fqdn, port, cert}, or the Caddy site."""
-        if self.web_server() == "caddy":
-            return self.caddy_steps(v)
-        R = self.runner
-
-        def cert(log):
-            if v["cert"] == "skip":
-                log("Skipped: the nginx site expects /etc/letsencrypt/live/%s/." % v["fqdn"])
-                return True
-            email = self.settings.get("letsencrypt_email")
-            common = ["certbot", "certonly", "--non-interactive", "--agree-tos", "-d", v["fqdn"]]
-            common += ["-m", email] if email else ["--register-unsafely-without-email"]
-            if v["cert"] == "cloudflare":
-                cmd = common + ["--dns-cloudflare", "--dns-cloudflare-credentials", str(CF_CREDENTIALS),
-                                "--dns-cloudflare-propagation-seconds", "30"]
-            else:
-                cmd = common + ["--nginx"]
-            for attempt in range(4):
-                code, out = R.run(cmd, root=True, timeout=600)
-                if code == 0 or "Another instance of Certbot" not in out or attempt == 3:
-                    break
-                log("Another certbot is running (often the automatic renewal); trying again in 30 seconds…")
-                import time
-                time.sleep(30)
-            log(out[-1500:])
-            return code == 0
-
-        def nginx(log):
-            d = self.nginx_dir(log)
-            if not d:
-                return False
-            # Always .conf: many nginx setups only load *.conf files.
-            path = f"{d}/{v['name']}.conf"
-            # Never replace a site someone wrote by hand: only files with our marker.
-            code, out = R.run(["grep", "-rlE", f"server_name[^;]*[[:space:]]{re.escape(v['fqdn'])}[[:space:];]",
-                               "/etc/nginx"], root=True)
-            for f in [x.strip() for x in out.splitlines() if x.strip()] + [path]:
-                exists = R.run(["test", "-e", f], root=True)[0] == 0
-                if exists and R.run(["grep", "-qF", MARKER, f], root=True)[0] != 0:
-                    log(f"{f} already exists and wasn't written by this tool"
-                        + (f" (it serves {v['fqdn']})" if f != path else "") + ", so it's left alone. "
-                        "If that site works, there's nothing to do; otherwise move that file away and Retry.")
-                    return False
-            code, out = R.write_file(path, nginx_site(v["name"], v["fqdn"], v["port"]), root=True)
-            if code != 0:
-                log(out)
-                return False
-            log(f"Wrote {path}")
-            if d.endswith("sites-available"):
-                R.run(["ln", "-sf", path, path.replace("sites-available", "sites-enabled")], root=True)
-            code, out = R.run(["nginx", "-t"], root=True)
-            log(out)
-            if code != 0:
-                log("nginx doesn't accept it: the site file was left in place for you to look at; nginx wasn't reloaded.")
-                return False
-            code, out = R.run(["systemctl", "reload", "nginx"], root=True)
-            log(out)
-            return code == 0
-
-        return [("Certificate", cert), ("nginx site", nginx)]
-
     def finish_web(self):
         """For a server that runs but isn't on the web yet (e.g. an add that stopped at the certificate)."""
         s = self.selected()
@@ -1658,33 +1385,16 @@ class Main(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(
                 self, APP, f"{s.name} has no address in its options.json (hostname), so there's nothing to set up.")
             return
-        if self.web_server() == "caddy":
-            if QtWidgets.QMessageBox.question(
-                    self, "Set up web access",
-                    f"Add {s.hostname} to Caddy, sending it to port {s.port}?\n\nThe new site copies your existing "
-                    "site's settings. Caddy gets the HTTPS certificate itself. The server and its DNS record "
-                    "aren't touched.") != QtWidgets.QMessageBox.Yes:
-                return
-            v = {"name": s.name, "fqdn": s.hostname, "port": s.port, "cert": "caddy"}
-            if not self.check_programs(v):
-                return
-            self.run_steps(f"Web access for {s.name}", self.web_steps(v), lambda ok: ok and QtWidgets.QMessageBox.information(
-                self, APP, f"https://{s.hostname} is set up. Open it to enter the licence key."))
+        if QtWidgets.QMessageBox.question(
+                self, "Set up web access",
+                f"Add {s.hostname} to Caddy, sending it to port {s.port}?\n\nThe new site copies your existing "
+                "site's settings. Caddy gets the HTTPS certificate itself. The server and its DNS record "
+                "aren't touched.") != QtWidgets.QMessageBox.Yes:
             return
-        choices = ["Through Cloudflare DNS (needs the Cloudflare token)", "Through nginx (HTTP check)",
-                   "Skip the certificate (one is already in /etc/letsencrypt/live/)"]
-        pick, ok = QtWidgets.QInputDialog.getItem(
-            self, "Set up web access",
-            f"This gets an HTTPS certificate for {s.hostname} and adds the nginx site that sends it to port "
-            f"{s.port}.\nThe server itself and its DNS record aren't touched.\n\nHow should Let's Encrypt check "
-            "that you own the address?", choices, 0 if cloudflare_token() else 1, False)
-        if not ok:
+        v = {"name": s.name, "fqdn": s.hostname, "port": s.port}
+        if not self.check_programs(("caddy",)):
             return
-        v = {"name": s.name, "fqdn": s.hostname, "port": s.port,
-             "cert": ["cloudflare", "nginx", "skip"][choices.index(pick)]}
-        if not self.check_programs(v):
-            return
-        self.run_steps(f"Web access for {s.name}", self.web_steps(v), lambda ok: ok and QtWidgets.QMessageBox.information(
+        self.run_steps(f"Web access for {s.name}", self.caddy_steps(v), lambda ok: ok and QtWidgets.QMessageBox.information(
             self, APP, f"https://{s.hostname} is set up. Open it to enter the licence key."))
 
     # ---- remove ------------------------------------------------------------------------
@@ -1695,7 +1405,7 @@ class Main(QtWidgets.QMainWindow):
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle(APP)
         box.setIcon(QtWidgets.QMessageBox.Warning)
-        box.setText(f"Remove {s.name} from pm2 and {self.web_server().capitalize()}?")
+        box.setText(f"Remove {s.name} from pm2 and Caddy?")
         box.setInformativeText("Its install and data folders (worlds, licence) are kept unless you tick the box.")
         files = QtWidgets.QCheckBox(f"Also delete {s.data_path} and the install folder")
         box.setCheckBox(files)
@@ -1727,23 +1437,6 @@ class Main(QtWidgets.QMainWindow):
             log(out[-800:])
             return code == 0 and R.run(["systemctl", "reload", "caddy"], root=True)[0] == 0
 
-        def nginx(log):
-            if not s.hostname:
-                log("No address in its options.json: nginx left as is.")
-                return True
-            code, out = R.run(["grep", "-rlF", f"{MARKER}: {s.name}", "/etc/nginx"], root=True)
-            mine = [f for f in out.splitlines() if f.strip()]
-            if not mine:
-                log("Its nginx site wasn't written by this tool: left as is (remove it yourself if you want).")
-                return True
-            for f in mine:
-                R.run(["rm", "-f", f], root=True)
-                R.run(["rm", "-f", f.replace("sites-available", "sites-enabled")], root=True)
-                log(f"Removed {f}")
-            code, out = R.run(["nginx", "-t"], root=True)
-            log(out)
-            return code == 0 and R.run(["systemctl", "reload", "nginx"], root=True)[0] == 0
-
         def folders(log):
             app = str(Path(s.app_path).parent) if s.app_path else ""
             if app.endswith("resources/app"):
@@ -1753,7 +1446,7 @@ class Main(QtWidgets.QMainWindow):
                     log(R.run(["rm", "-rf", d], user=u)[1] or f"Deleted {d}")
             return True
 
-        steps = [("pm2", pm2), ("Caddy", caddy) if self.web_server() == "caddy" else ("nginx", nginx)]
+        steps = [("pm2", pm2), ("Caddy", caddy)]
         if files.isChecked():
             steps.append(("Folders", folders))
         self.run_steps(f"Removing {s.name}", steps)
