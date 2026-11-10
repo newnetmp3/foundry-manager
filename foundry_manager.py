@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -307,22 +308,26 @@ class Worker(QtCore.QThread):
     line = QtCore.Signal(str)
     finished_ok = QtCore.Signal(bool)
 
-    def __init__(self, steps):
+    def __init__(self, steps, start=0):
         super().__init__()
         self.steps = steps  # list of (label, callable(log) -> bool)
+        self.start_at = start
+        self.failed_at = None  # index of the step that failed, for Retry
 
     def run(self):
         ok = True
-        for label, fn in self.steps:
+        for i in range(self.start_at, len(self.steps)):
+            label, fn = self.steps[i]
             self.line.emit(f"▶ {label}")
             try:
                 if not fn(self.line.emit):
                     self.line.emit(f"✗ {label} failed.")
                     ok = False
-                    break
             except Exception as e:  # keep the GUI alive whatever happens
                 self.line.emit(f"✗ {label}: {e}")
                 ok = False
+            if not ok:
+                self.failed_at = i
                 break
             self.line.emit(f"✓ {label}")
         self.finished_ok.emit(ok)
@@ -337,11 +342,21 @@ class LogDialog(QtWidgets.QDialog):
         self.text = QtWidgets.QPlainTextEdit(readOnly=True)
         self.text.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
         lay.addWidget(self.text)
+        btns = QtWidgets.QHBoxLayout()
+        self.hint = QtWidgets.QLabel("")
+        self.hint.setWordWrap(True)
+        btns.addWidget(self.hint, 1)
+        # Shown when a step fails: runs again from that step (the steps before it stay done).
+        self.retry_btn = QtWidgets.QPushButton(QtGui.QIcon.fromTheme("view-refresh"), "Retry")
+        self.retry_btn.hide()
+        btns.addWidget(self.retry_btn)
         self.close_btn = QtWidgets.QPushButton("Close")
         self.close_btn.clicked.connect(self.accept)
-        lay.addWidget(self.close_btn, alignment=QtCore.Qt.AlignRight)
+        btns.addWidget(self.close_btn)
+        lay.addLayout(btns)
 
     def add(self, s: str):
+        s = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", s)  # pm2 and others colour their output
         self.text.appendPlainText(s)
         self.text.verticalScrollBar().setValue(self.text.verticalScrollBar().maximum())
 
@@ -1031,6 +1046,8 @@ class Main(QtWidgets.QMainWindow):
         act("Open", "internet-web-browser", self.open_browser)
         tb.addSeparator()
         act("Add server…", "list-add", self.add_server)
+        act("Set up web access…", "network-server", self.finish_web,
+            "Certificate and nginx site for the selected server (if adding it stopped before those)")
         act("Remove…", "list-remove", self.remove_server)
         tb.addSeparator()
         act("Settings…", "configure", self.edit_settings, "Change the answers from setup")
@@ -1071,16 +1088,38 @@ class Main(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, APP, "This needs sudo, and the password wasn't given or was wrong.")
             return
         dlg = LogDialog(self, title)
-        w = Worker(steps)
-        w.line.connect(dlg.add)
-        def finished(ok):
-            dlg.add("\nDone." if ok else "\nStopped: see above.")
-            self.refresh()
-            if done:
-                done(ok)
-        w.finished_ok.connect(finished)
-        self.workers.append(w)
-        w.start()
+
+        def start(at):
+            dlg.retry_btn.hide()
+            dlg.hint.setText("")
+            w = Worker(steps, at)
+            w.line.connect(dlg.add)
+
+            def finished(ok):
+                self.refresh()
+                if ok:
+                    dlg.add("\nDone.")
+                    if done:
+                        done(ok)
+                    return
+                label = steps[w.failed_at][0]
+                dlg.add(f"\nStopped at “{label}”: see above. The steps before it are done.")
+                dlg.hint.setText(f"Fix what's above, then Retry to carry on from “{label}”.")
+                dlg.retry_btn.setText(f"Retry from “{label}”")
+                dlg.retry_btn.show()
+                dlg._retry_at = w.failed_at
+            w.finished_ok.connect(finished)
+            self.workers.append(w)
+            w.start()
+
+        def retry():
+            if not self.runner.ensure():
+                QtWidgets.QMessageBox.warning(self, APP, "This needs sudo, and the password wasn't given or was wrong.")
+                return
+            dlg.add("")
+            start(dlg._retry_at)
+        dlg.retry_btn.clicked.connect(retry)
+        start(0)
         dlg.show()
 
     # ---- listing ---------------------------------------------------------------
@@ -1200,6 +1239,8 @@ class Main(QtWidgets.QMainWindow):
         if not dlg.exec():
             return
         v = dlg.values()
+        if not self.check_programs(v):
+            return
         u = self.user
         R = self.runner
         state = {}
@@ -1212,7 +1253,7 @@ class Main(QtWidgets.QMainWindow):
         def install(log):
             z = v["app_dir"] + "/foundryvtt.zip"
             if re.match(r"https?://", v["source"]):
-                code, out = R.run(["curl", "-fL", "--retry", "3", "-o", z, v["source"]], user=u, timeout=1800)
+                code, out = R.run(["curl", "-fsSL", "--retry", "3", "-o", z, v["source"]], user=u, timeout=1800)
             else:
                 code, out = R.run(["install", "-m", "644", "-o", u, v["source"], z], root=True)
             log(out[-500:])
@@ -1272,6 +1313,53 @@ class Main(QtWidgets.QMainWindow):
             log(("Created " if r.get("success") else "Cloudflare refused: ") + json.dumps(r.get("result") or r.get("errors"))[:400])
             return bool(r.get("success"))
 
+        steps = [
+            ("Create folders", mkdirs),
+            ("Install Foundry", install),
+            ("Write options.json", options),
+            ("Start under pm2", pm2),
+        ]
+        if v["dns"]:
+            steps.append(("Cloudflare DNS record", dns))
+        steps += self.web_steps(v)
+
+        def done(ok):
+            if ok:
+                QtWidgets.QMessageBox.information(
+                    self, APP,
+                    f"https://{v['fqdn']} is set up.\n\nOpen it, enter your second licence key and accept the "
+                    "licence agreement, then set an admin password."
+                    + ("\n\nDNS can take a minute to reach everyone." if v["dns"] else ""))
+        self.run_steps(f"Adding {v['name']}", steps, done)
+
+    def check_programs(self, v) -> bool:
+        """Before changing anything: are the programs the steps use installed?"""
+        need = [("curl", "curl"), ("unzip", "unzip"), ("nginx", "nginx")]
+        if v["cert"] != "skip":
+            need.append(("certbot", "certbot"))
+        missing = sorted({pkg for cmd, pkg in need if not shutil.which(cmd)})
+        import importlib.util
+        plugin = {"cloudflare": ("certbot_dns_cloudflare", "certbot-dns-cloudflare"),
+                  "nginx": ("certbot_nginx", "certbot-nginx")}.get(v["cert"])
+        if plugin and not importlib.util.find_spec(plugin[0]):
+            missing.append(plugin[1])
+        if not missing:
+            return True
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle(APP)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setText("Some programs the new server needs aren't installed:\n\n    " + ", ".join(missing)
+                    + "\n\nInstall them first (in a terminal):\n\n    sudo pacman -S --needed " + " ".join(missing)
+                    + "\n\nNothing has been changed yet.")
+        box.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        box.setStandardButtons(QtWidgets.QMessageBox.Cancel | QtWidgets.QMessageBox.Ignore)
+        box.button(QtWidgets.QMessageBox.Ignore).setText("Continue anyway")
+        return box.exec() == QtWidgets.QMessageBox.Ignore
+
+    def web_steps(self, v) -> list:
+        """Certificate and nginx site for v = {name, fqdn, port, cert}."""
+        R = self.runner
+
         def cert(log):
             if v["cert"] == "skip":
                 log("Skipped: the nginx site expects /etc/letsencrypt/live/%s/." % v["fqdn"])
@@ -1294,6 +1382,16 @@ class Main(QtWidgets.QMainWindow):
                 return False
             # Always .conf: many nginx setups only load *.conf files.
             path = f"{d}/{v['name']}.conf"
+            # Never replace a site someone wrote by hand: only files with our marker.
+            code, out = R.run(["grep", "-rlE", f"server_name[^;]*[[:space:]]{re.escape(v['fqdn'])}[[:space:];]",
+                               "/etc/nginx"], root=True)
+            for f in [x.strip() for x in out.splitlines() if x.strip()] + [path]:
+                exists = R.run(["test", "-e", f], root=True)[0] == 0
+                if exists and R.run(["grep", "-qF", MARKER, f], root=True)[0] != 0:
+                    log(f"{f} already exists and wasn't written by this tool"
+                        + (f" (it serves {v['fqdn']})" if f != path else "") + ", so it's left alone. "
+                        "If that site works, there's nothing to do; otherwise move that file away and Retry.")
+                    return False
             code, out = R.write_file(path, nginx_site(v["name"], v["fqdn"], v["port"]), root=True)
             if code != 0:
                 log(out)
@@ -1310,24 +1408,32 @@ class Main(QtWidgets.QMainWindow):
             log(out)
             return code == 0
 
-        steps = [
-            ("Create folders", mkdirs),
-            ("Install Foundry", install),
-            ("Write options.json", options),
-            ("Start under pm2", pm2),
-        ]
-        if v["dns"]:
-            steps.append(("Cloudflare DNS record", dns))
-        steps += [("Certificate", cert), ("nginx site", nginx)]
+        return [("Certificate", cert), ("nginx site", nginx)]
 
-        def done(ok):
-            if ok:
-                QtWidgets.QMessageBox.information(
-                    self, APP,
-                    f"https://{v['fqdn']} is set up.\n\nOpen it, enter your second licence key and accept the "
-                    "licence agreement, then set an admin password."
-                    + ("\n\nDNS can take a minute to reach everyone." if v["dns"] else ""))
-        self.run_steps(f"Adding {v['name']}", steps, done)
+    def finish_web(self):
+        """For a server that runs but isn't on the web yet (e.g. an add that stopped at the certificate)."""
+        s = self.selected()
+        if not s:
+            return
+        if not s.hostname:
+            QtWidgets.QMessageBox.information(
+                self, APP, f"{s.name} has no address in its options.json (hostname), so there's nothing to set up.")
+            return
+        choices = ["Through Cloudflare DNS (needs the Cloudflare token)", "Through nginx (HTTP check)",
+                   "Skip the certificate (one is already in /etc/letsencrypt/live/)"]
+        pick, ok = QtWidgets.QInputDialog.getItem(
+            self, "Set up web access",
+            f"This gets an HTTPS certificate for {s.hostname} and adds the nginx site that sends it to port "
+            f"{s.port}.\nThe server itself and its DNS record aren't touched.\n\nHow should Let's Encrypt check "
+            "that you own the address?", choices, 0 if cloudflare_token() else 1, False)
+        if not ok:
+            return
+        v = {"name": s.name, "fqdn": s.hostname, "port": s.port,
+             "cert": ["cloudflare", "nginx", "skip"][choices.index(pick)]}
+        if not self.check_programs(v):
+            return
+        self.run_steps(f"Web access for {s.name}", self.web_steps(v), lambda ok: ok and QtWidgets.QMessageBox.information(
+            self, APP, f"https://{s.hostname} is set up. Open it to enter the licence key."))
 
     # ---- remove ------------------------------------------------------------------------
     def remove_server(self):

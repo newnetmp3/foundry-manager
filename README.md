@@ -79,6 +79,18 @@ address, the DNS record, port and folders, the HTTPS certificate, and last the
 Foundry download (last because the timed link expires after a few minutes).
 A summary page shows everything before **Create server** changes anything.
 
+## If a step fails
+
+The log window stops at the failed step and says why; the steps before it
+stay done. Fix the cause (for example, install a missing program), then click
+**Retry from “…”** to carry on from that step. Before anything starts, the tool
+also checks that curl, unzip, nginx and certbot (with the plugin you chose)
+are installed, and tells you the pacman command if not.
+
+If the window was closed, select the server and use **Set up web access…**:
+it runs just the certificate and nginx steps for a server that's already
+running. It never replaces an nginx file it didn't write.
+
 ## How it uses sudo
 
 The tool runs as you. Commands for the Foundry user run through
