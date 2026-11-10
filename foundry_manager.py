@@ -240,6 +240,46 @@ def port_free(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) != 0
 
 
+def site_dirs(conf: str) -> list[str]:
+    """Folders that nginx.conf includes *directly inside http { }* with a wildcard (where site files go).
+
+    Folders included elsewhere (top-level modules.d for load_module, snippets inside server blocks)
+    don't take site files. Relative paths are relative to /etc/nginx.
+    """
+    text = re.sub(r"#[^\n]*", "", conf)
+    stack, buf, found = [], "", []
+    for ch in text:
+        if ch not in "{};":
+            buf += ch
+            continue
+        stmt = buf.strip()
+        buf = ""
+        if ch == "{":
+            stack.append(stmt.split()[0] if stmt else "")
+        elif ch == "}":
+            if stack:
+                stack.pop()
+        elif stack == ["http"] and re.match(r"include\s", stmt):
+            path = stmt.split(None, 1)[1].strip().strip("'\"")
+            if "*" not in Path(path).name or "mime" in path:
+                continue
+            d = str((Path("/etc/nginx") / path).parent)
+            if d not in found:
+                found.append(d)
+    # Prefer the usual site folders.
+    rank = lambda d: 0 if d.endswith("sites-enabled") else 1 if d.endswith("conf.d") else 2
+    return sorted(found, key=rank)
+
+
+def add_sites_include(conf: str) -> str | None:
+    """nginx.conf with `include sites-enabled/*.conf;` added at the start of the http block."""
+    m = re.search(r"^(\s*)http\s*\{[^\n]*\n", conf, re.M)
+    if not m:
+        return None
+    line = f"{m.group(1)}    include sites-enabled/*.conf;  {MARKER}\n"
+    return conf[: m.end()] + line + conf[m.end():]
+
+
 def nginx_site(name: str, fqdn: str, port: int) -> str:
     return f"""{MARKER}: {name}
 # Foundry VTT at https://{fqdn} -> 127.0.0.1:{port}
@@ -1212,26 +1252,50 @@ class Main(QtWidgets.QMainWindow):
 
     # ---- nginx folder ------------------------------------------------------------
     def nginx_dir(self, log) -> str | None:
+        """The folder nginx loads site files from (inside its http block)."""
         if self.settings.get("nginx_dir"):
-            return self.settings["nginx_dir"]
-        files = []
-        code = 1
-        if self.settings["existing_domain"]:
-            dom = re.escape(self.settings["existing_domain"])
-            code, out = self.runner.run(["grep", "-rlE", f"server_name[^;]*{dom}", "/etc/nginx"], root=True)
-            files = [f for f in out.splitlines() if f.strip() and not f.endswith("nginx.conf")]
-        if code == 0 and files:
-            d = str(Path(files[0]).parent)
-            # A file in sites-available is enabled by a link in sites-enabled.
-            log(f"Your existing site is in {files[0]}; the new one goes next to it.")
+            return str(Path("/etc/nginx") / self.settings["nginx_dir"])
+        R = self.runner
+        code, conf = R.run(["cat", "/etc/nginx/nginx.conf"], root=True)
+        if code != 0:
+            log("Couldn't read /etc/nginx/nginx.conf: is nginx installed?")
+            return None
+        dirs = site_dirs(conf)
+        def available(d):
+            # Sites in sites-enabled are usually links to files in sites-available.
+            if d.endswith("/sites-enabled"):
+                alt = d[: -len("enabled")] + "available"
+                if R.run(["test", "-d", alt], root=True)[0] == 0:
+                    return alt
             return d
-        code, inc = self.runner.run(["grep", "-hE", r"^\s*include\s", "/etc/nginx/nginx.conf"], root=True)
-        for line in inc.splitlines():
-            m = re.search(r"include\s+(\S+)/\*(\.conf)?;", line)
-            if m and "mime" not in m.group(1):
-                return m.group(1)
-        log("Couldn't find where nginx keeps sites: set the nginx sites folder in Settings.")
-        return None
+        # Next to the existing site, if it's in one of those folders.
+        if self.settings["existing_domain"] and dirs:
+            dom = re.escape(self.settings["existing_domain"])
+            code, out = R.run(["grep", "-rlE", f"server_name[^;]*{dom}", "/etc/nginx"], root=True)
+            for f in [x.strip() for x in out.splitlines() if x.strip()]:
+                parent = str(Path(f).parent)
+                if parent in dirs or parent in [available(d) for d in dirs]:
+                    log(f"Your existing site is in {f}; the new one goes next to it.")
+                    return parent
+        if dirs:
+            d = available(dirs[0])
+            log(f"nginx loads sites from {dirs[0]}; the new site goes in {d}.")
+            return d
+        # nginx.conf includes no folder of sites: add the usual one.
+        log("nginx.conf doesn't load a folder of site files, so the tool adds the usual one: "
+            "/etc/nginx/sites-enabled (with sites-available). A backup of nginx.conf is kept as "
+            "/etc/nginx/nginx.conf.foundry-manager.bak.")
+        patched = add_sites_include(conf)
+        if patched is None:
+            log("Couldn't find the http { block in nginx.conf: set the nginx sites folder in Settings.")
+            return None
+        R.run(["mkdir", "-p", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled"], root=True)
+        R.run(["cp", "-n", "/etc/nginx/nginx.conf", "/etc/nginx/nginx.conf.foundry-manager.bak"], root=True)
+        code, out = R.write_file("/etc/nginx/nginx.conf", patched, root=True)
+        if code != 0:
+            log(out)
+            return None
+        return "/etc/nginx/sites-available"
 
     # ---- add a server ------------------------------------------------------------
     def add_server(self):
@@ -1372,7 +1436,13 @@ class Main(QtWidgets.QMainWindow):
                                 "--dns-cloudflare-propagation-seconds", "30"]
             else:
                 cmd = common + ["--nginx"]
-            code, out = R.run(cmd, root=True, timeout=600)
+            for attempt in range(4):
+                code, out = R.run(cmd, root=True, timeout=600)
+                if code == 0 or "Another instance of Certbot" not in out or attempt == 3:
+                    break
+                log("Another certbot is running (often the automatic renewal); trying again in 30 seconds…")
+                import time
+                time.sleep(30)
             log(out[-1500:])
             return code == 0
 
