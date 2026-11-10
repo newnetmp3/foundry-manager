@@ -153,12 +153,15 @@ class Runner:
             if not self.ensure():
                 return 1, "sudo isn't available (password not given or wrong)"
             if user:
-                line = " ".join(shlex.quote(c) for c in cmd)
+                # Start in that user's home: a process it starts (pm2!) must not inherit a folder
+                # the user can't open, such as the desktop user's home.
+                line = "cd ~ && " + " ".join(shlex.quote(c) for c in cmd)
                 cmd = ["sudo", "-n", "-u", user, "-H", "bash", "-lc", line]
             else:
                 cmd = ["sudo", "-n"] + cmd
         try:
-            p = subprocess.run(cmd, input=stdin, text=True, capture_output=True, timeout=timeout)
+            p = subprocess.run(cmd, input=stdin, text=True, capture_output=True, timeout=timeout,
+                               cwd="/" if (user or root) else None)
         except subprocess.TimeoutExpired:
             return 124, "timed out: " + " ".join(cmd)
         except FileNotFoundError as e:
@@ -183,6 +186,8 @@ class Server:
     port: int = 30000
     data_path: str = ""
     app_path: str = ""
+    cwd: str = ""   # pm2's start folder for the process
+    args: list = field(default_factory=list)
     hostname: str = ""
     pm_id: int | None = None
     users: int | None = None
@@ -221,7 +226,7 @@ def parse_pm2(jlist: str, home: str) -> list[Server]:
             name=str(p.get("name", "")), status=str(env.get("status", "unknown")),
             port=int(port) if port.isdigit() else 0,
             data_path=arg_value(args, "--dataPath") or f"{home}/.local/share/FoundryVTT",
-            app_path=script, pm_id=p.get("pm_id"),
+            app_path=script, pm_id=p.get("pm_id"), cwd=str(env.get("pm_cwd", "")), args=args,
         ))
     return out
 
@@ -1153,23 +1158,44 @@ class Main(QtWidgets.QMainWindow):
             s.version = (st or {}).get("version") or ""
         self.table.setRowCount(len(self.servers))
         for r, s in enumerate(self.servers):
-            vals = [s.name, s.status, s.hostname or "–", str(s.port or "–"),
+            status = "can't start (folder)" if self.bad_cwd(s) and not s.version and s.status == "online" else s.status
+            vals = [s.name, status, s.hostname or "–", str(s.port or "–"),
                     "–" if s.users is None else str(s.users), s.world, s.version, s.data_path]
             for c, v in enumerate(vals):
                 it = QtWidgets.QTableWidgetItem(v)
                 if c == 1:
-                    it.setForeground(QtGui.QColor("#2e9d4f" if s.status == "online" else "#c0392b"))
+                    it.setForeground(QtGui.QColor("#2e9d4f" if status == "online" else "#c0392b"))
+                    if status != s.status:
+                        it.setToolTip("pm2 started it from " + s.cwd + ", which " + self.user + " can't open, so it "
+                                      "never really runs. Restart fixes it.")
                 self.table.setItem(r, c, it)
         self.table.resizeColumnsToContents()
         n = sum(s.users or 0 for s in self.servers)
         self.status.showMessage(f"{len(self.servers)} server(s), {n} player(s) connected · Foundry user: {self.user}")
 
     # ---- actions ---------------------------------------------------------------
+    def bad_cwd(self, s: Server) -> bool:
+        """Started from a folder outside the Foundry user's home (it can't run there)."""
+        home = self.home().rstrip("/")
+        return bool(s.cwd) and not (s.cwd == home or s.cwd.startswith(home + "/"))
+
     def pm2_action(self, what):
         s = self.selected()
         if not s:
             return
-        code, out = self.runner.run(["pm2", what, s.name], user=self.user, timeout=120)
+        if what in ("start", "restart") and self.bad_cwd(s) and s.app_path:
+            # pm2 keeps the start folder, so a plain restart would fail the same way: start it afresh.
+            folder = str(Path(s.app_path).parent)
+            if folder.endswith("resources/app"):
+                folder = str(Path(folder).parent.parent)
+            cmd = ["pm2", "delete", s.name]
+            self.runner.run(cmd, user=self.user, timeout=120)
+            code, out = self.runner.run(["pm2", "start", s.app_path, "--name", s.name, "--cwd", folder, "--", *s.args],
+                                        user=self.user, timeout=120)
+            if code == 0:
+                self.runner.run(["pm2", "save"], user=self.user)
+        else:
+            code, out = self.runner.run(["pm2", what, s.name], user=self.user, timeout=120)
         if code != 0:
             QtWidgets.QMessageBox.warning(self, APP, out[-2000:])
         self.refresh()
@@ -1319,7 +1345,7 @@ class Main(QtWidgets.QMainWindow):
             return code == 0
 
         def pm2(log):
-            code, out = R.run(["pm2", "start", state["entry"], "--name", v["name"], "--",
+            code, out = R.run(["pm2", "start", state["entry"], "--name", v["name"], "--cwd", v["app_dir"], "--",
                                f"--dataPath={v['data_dir']}", f"--port={v['port']}"], user=u, timeout=120)
             log(out[-800:])
             if code != 0:
