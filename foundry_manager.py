@@ -839,8 +839,11 @@ class AddWizard:
         self.dns = QtWidgets.QCheckBox(f"Create the DNS record in Cloudflare (CNAME to {target or '…'})")
         self.dns.setChecked(has_token and bool(target))
         self.dns.setEnabled(has_token and bool(target))
-        self.proxied = QtWidgets.QCheckBox("Proxied through Cloudflare (orange cloud)")
-        self.proxied.setChecked(True)
+        # Proxy status: the same as the existing address by default, since that's what works with
+        # this machine's Caddy (a proxied record can stop Caddy getting its certificate).
+        self.proxied = QtWidgets.QComboBox()
+        self.proxied.addItems([f"Same as {target or 'the existing address'} (recommended)",
+                               "DNS only (grey cloud)", "Proxied (orange cloud)"])
         self.dns.toggled.connect(self.proxied.setEnabled)
         self.proxied.setEnabled(self.dns.isChecked())
         self.dns_note = note("")
@@ -849,11 +852,15 @@ class AddWizard:
             "<p>A browser finds a server through a <b>DNS record</b>. The new address gets a <b>CNAME</b> record "
             f"pointing at <code>{target or 'your existing address'}</code>: “this name lives wherever that one "
             "does”. If this machine's IP ever changes, only the existing record needs updating.</p>"
-            "<p><b>Proxied</b> (Cloudflare's orange cloud) sends visitors through Cloudflare, which hides "
-            "this machine's IP and filters attacks. Foundry works fine through it. Turn it off only if you "
-            "want players to connect directly.</p>"))
+            "<p><b>Proxy status.</b> <i>DNS only</i> (grey cloud) sends players straight to this machine. "
+            "<i>Proxied</i> (orange cloud) sends them through Cloudflare, which hides this machine's IP. "
+            "Caddy needs Let's Encrypt to reach it to get the HTTPS certificate, which a proxied address "
+            "can block; if it does, Cloudflare shows <b>error 525</b>. Matching your existing address is "
+            "safest, because that one already works.</p>"))
         lay.addWidget(self.dns)
-        lay.addWidget(self.proxied)
+        form = QtWidgets.QFormLayout()
+        form.addRow("Proxy status:", self.proxied)
+        lay.addLayout(form)
         lay.addWidget(self.dns_note)
         lay.addStretch()
         def init_dns():
@@ -968,7 +975,8 @@ class AddWizard:
 
     def _fill_summary(self):
         v = self.values()
-        dns = (f"CNAME to {self.settings['existing_domain']}" + (", proxied" if v["proxied"] else ", DNS only")
+        dns = (f"CNAME to {self.settings['existing_domain']}, "
+               + {"same": "same proxy status as it", False: "DNS only", True: "proxied"}[v["proxied"]]
                if v["dns"] else "you add it yourself")
         src = "timed link" if re.match(r"https?://", v["source"]) else v["source"]
         rows = [("Name", v["name"]), ("Address", f"https://{v['fqdn']}"), ("DNS record", dns),
@@ -988,7 +996,7 @@ class AddWizard:
             "name": self.name.text().strip(), "fqdn": self.fqdn.text().strip().lower(), "port": self.port.value(),
             "app_dir": self.app_dir.text().strip(), "data_dir": self.data_dir.text().strip(),
             "source": self.source.text().strip(), "dns": self.dns.isChecked() and self.dns.isEnabled(),
-            "proxied": self.proxied.isChecked(),
+            "proxied": ["same", False, True][self.proxied.currentIndex()],
         }
 
 
@@ -1334,9 +1342,14 @@ class Main(QtWidgets.QMainWindow):
             if have.get("result"):
                 log(f"Cloudflare already has a record for {v['fqdn']}: leaving it.")
                 return True
+            proxied = v["proxied"]
+            if proxied == "same":
+                ex = cloudflare("GET", f"/zones/{zid}/dns_records?name={self.settings['existing_domain']}", token)
+                proxied = bool((ex.get("result") or [{}])[0].get("proxied"))
+                log(f"{self.settings['existing_domain']} is {'proxied' if proxied else 'DNS only'}: the new record matches.")
             r = cloudflare("POST", f"/zones/{zid}/dns_records", token, {
                 "type": "CNAME", "name": v["fqdn"], "content": self.settings["existing_domain"],
-                "proxied": v["proxied"], "ttl": 1, "comment": "Foundry VTT (Foundry Server Manager)",
+                "proxied": proxied, "ttl": 1, "comment": "Foundry VTT (Foundry Server Manager)",
             })
             log(("Created " if r.get("success") else "Cloudflare refused: ") + json.dumps(r.get("result") or r.get("errors"))[:400])
             return bool(r.get("success"))
