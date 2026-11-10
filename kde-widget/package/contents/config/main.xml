@@ -24,5 +24,13 @@
       <min>1</min>
       <max>65535</max>
     </entry>
+    <entry name="showHistory" type="Bool">
+      <label>Show the 24-hour history chart in the popup</label>
+      <default>false</default>
+    </entry>
+    <entry name="history" type="String">
+      <label>Saved player counts for the history chart (written by the widget)</label>
+      <default></default>
+    </entry>
   </group>
 </kcfg>

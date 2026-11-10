@@ -4,7 +4,7 @@ Shows how many people are connected to a Foundry VTT server, on the desktop
 or in a panel, next to Foundry's logo (loaded from your own server's
 `/icons/vtt-512.png`, the same file browsers get; the theme's games icon
 stands in until it loads). Click it for the world, Foundry and system versions; right-click
-for **Check now** and **Open Foundry**.
+for **Check now**, **24-hour history** and **Open Foundry**.
 
 It reads Foundry's own status page, `/api/status`, which anyone can read, so
 it works however Foundry is run (Node.js or Docker) and whichever system user
@@ -50,3 +50,17 @@ Right-click the widget → **Configure Foundry VTT Players…**
 - the number in green: people connected
 - `0`: the server is up with nobody on, or no world is running (see the popup)
 - `–` in red: the status page can't be reached
+
+## 24-hour history
+
+Right-click → **24-hour history** (tick it) to show a chart of the last 24
+hours in the popup; untick it to hide it. Each bar is a 5-minute slot, showing
+the most people connected during it; the newest is on the right, and the chart
+scrolls left as time passes. A thin line means the server was up with nobody
+on; a gap means the status page didn't answer. Hover a bar for its time and
+count; the top right shows the day's peak.
+
+The widget records while it runs (whether or not the chart is shown) and
+saves the last 24 hours in its settings, so the history survives a Plasma
+restart. Changing the status page starts a new history.
+

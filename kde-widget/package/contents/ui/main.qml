@@ -30,6 +30,51 @@ PlasmoidItem {
     property string problem: ""
     property date checkedAt: new Date(0)
 
+    // ---- 24-hour history ----------------------------------------------------
+    // The most people connected in each 5-minute slot, for the last 24 hours:
+    // [{t: slot start (ms), v: people}]. Slots with no answer from the server
+    // are missing (gaps in the chart). Saved in the widget's settings so it
+    // survives a Plasma restart; started afresh when the status page changes.
+    readonly property int slotMs: 5 * 60 * 1000
+    readonly property int spanMs: 24 * 60 * 60 * 1000
+    property var history: []
+    property int historyRev: 0          // bumped on every change (redraws the chart)
+    property bool showHistory: Plasmoid.configuration.showHistory
+
+    function loadHistory() {
+        try {
+            const saved = JSON.parse(Plasmoid.configuration.history || "{}");
+            history = saved.url === String(statusUrl) && Array.isArray(saved.slots) ? saved.slots : [];
+        } catch (e) {
+            history = [];
+        }
+        historyRev++;
+    }
+    function saveHistory() {
+        Plasmoid.configuration.history = JSON.stringify({ url: String(statusUrl), slots: history });
+    }
+    function record(people) {
+        if (people < 0) return;
+        const now = Date.now();
+        const slot = Math.floor(now / slotMs) * slotMs;
+        const h = history.filter((s) => s.t > now - spanMs - slotMs);
+        const last = h.length ? h[h.length - 1] : null;
+        let changed = h.length !== history.length;
+        if (last && last.t === slot) {
+            if (people > last.v) { last.v = people; changed = true; }
+        } else {
+            h.push({ t: slot, v: people });
+            changed = true;
+        }
+        history = h;
+        if (changed) { historyRev++; saveHistory(); }
+    }
+    function peak() {
+        let best = null;
+        for (const s of history) if (!best || s.v > best.v) best = s;
+        return best;
+    }
+
     readonly property string statusUrl: Plasmoid.configuration.statusUrl
     readonly property bool online: reachable && worldActive
     // Foundry's logo, as the server itself serves it to browsers (not copied
@@ -90,6 +135,11 @@ PlasmoidItem {
             if (typeof d.users === "number") {
                 root.users = d.users;
                 root.howCounted = "status page";
+                root.record(root.worldActive ? d.users : 0);
+            } else if (!root.worldActive) {
+                root.users = 0;
+                root.howCounted = "status page";
+                root.record(0);
             } else {
                 root.users = -1;
                 countConnections();
@@ -123,6 +173,7 @@ PlasmoidItem {
             if (root.users < 0 || root.howCounted !== "status page") {
                 root.users = peers.size;
                 root.howCounted = "connections";
+                root.record(peers.size);
             }
         }
     }
@@ -134,13 +185,24 @@ PlasmoidItem {
         triggeredOnStart: true
         onTriggered: root.poll()
     }
-    onStatusUrlChanged: poll()
+    onStatusUrlChanged: { loadHistory(); poll(); }
+    Component.onCompleted: loadHistory()
 
     Plasmoid.contextualActions: [
         PlasmaCore.Action {
             text: i18n("Check now")
             icon.name: "view-refresh"
             onTriggered: root.poll()
+        },
+        PlasmaCore.Action {
+            text: i18n("24-hour history")
+            icon.name: "office-chart-bar"
+            checkable: true
+            checked: root.showHistory
+            onTriggered: {
+                Plasmoid.configuration.showHistory = checked;
+                if (checked) root.expanded = true;
+            }
         },
         PlasmaCore.Action {
             text: i18n("Open Foundry")
@@ -175,6 +237,132 @@ PlasmoidItem {
         }
     }
 
+    // ---- 24-hour history chart ------------------------------------------------------
+    // One bar per 5-minute slot, newest on the right; it scrolls left as time
+    // passes. Hover a bar for its time and count.
+    component HistoryChart: ColumnLayout {
+        spacing: Kirigami.Units.smallSpacing
+
+        RowLayout {
+            Layout.fillWidth: true
+            Kirigami.Heading {
+                level: 4
+                text: i18n("Last 24 hours")
+            }
+            Item { Layout.fillWidth: true }
+            PlasmaComponents.Label {
+                opacity: 0.7
+                text: {
+                    root.historyRev;  // re-evaluate on new data
+                    const p = root.peak();
+                    if (chart.hoverText) return chart.hoverText;
+                    return p ? i18n("Peak %1 at %2", p.v, Qt.formatTime(new Date(p.t), "hh:mm")) : i18n("No data yet");
+                }
+            }
+        }
+
+        Canvas {
+            id: chart
+            Layout.fillWidth: true
+            Layout.preferredHeight: Kirigami.Units.gridUnit * 6
+            property string hoverText: ""
+            property real hoverX: -1
+
+            function colorString(c, a) {
+                return "rgba(" + Math.round(c.r * 255) + "," + Math.round(c.g * 255) + "," + Math.round(c.b * 255) + "," + a + ")";
+            }
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+            onHoverXChanged: requestPaint()
+            Connections {
+                target: root
+                function onHistoryRevChanged() { chart.requestPaint(); }
+            }
+            // Scroll with the clock while the chart is open.
+            Timer {
+                interval: 60 * 1000
+                repeat: true
+                running: chart.visible && root.expanded
+                onTriggered: chart.requestPaint()
+            }
+
+            onPaint: {
+                const ctx = getContext("2d");
+                ctx.reset();
+                const w = width, h = height;
+                const top = 12, base = h - 1;
+                const now = Date.now(), start = now - root.spanMs;
+                const slots = root.history.filter((s) => s.t + root.slotMs > start);
+                let max = 1;
+                for (const s of slots) max = Math.max(max, s.v);
+                const text = Kirigami.Theme.textColor;
+                const bar = Kirigami.Theme.highlightColor;
+
+                // Guide lines: the top value and the middle (whole numbers only).
+                ctx.strokeStyle = colorString(text, 0.15);
+                ctx.lineWidth = 1;
+                ctx.fillStyle = colorString(text, 0.55);
+                ctx.font = "10px sans-serif";
+                const levels = max >= 2 ? [max, Math.round(max / 2)] : [max];
+                for (const lv of levels) {
+                    const y = Math.round(base - (lv / max) * (base - top)) + 0.5;
+                    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+                    ctx.fillText(String(lv), 2, y - 2);
+                }
+                // Hour marks every 6 hours of clock time.
+                const sixH = 6 * 3600 * 1000;
+                const tzOff = new Date().getTimezoneOffset() * 60000;
+                for (let t = Math.ceil((start - tzOff) / sixH) * sixH + tzOff; t < now; t += sixH) {
+                    const x = Math.round((t - start) / root.spanMs * w) + 0.5;
+                    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, base); ctx.stroke();
+                }
+                // Bars.
+                const bw = Math.max(1, root.slotMs / root.spanMs * w);
+                const hoverT = hoverX < 0 ? -1 : start + hoverX / w * root.spanMs;
+                for (const s of slots) {
+                    const x = (s.t - start) / root.spanMs * w;
+                    const hovered = hoverT >= s.t && hoverT < s.t + root.slotMs;
+                    ctx.fillStyle = colorString(bar, hovered ? 1 : 0.75);
+                    if (s.v > 0) {
+                        const bh = Math.max(2, (s.v / max) * (base - top));
+                        ctx.fillRect(x, base - bh, Math.max(1, bw - (bw > 3 ? 1 : 0)), bh);
+                    } else {
+                        // Server up, nobody on: a thin line, so it differs from a gap (no answer).
+                        ctx.fillStyle = colorString(text, 0.3);
+                        ctx.fillRect(x, base - 1, bw, 1);
+                    }
+                }
+                // Baseline.
+                ctx.fillStyle = colorString(text, 0.35);
+                ctx.fillRect(0, base, w, 1);
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                onPositionChanged: (mouse) => {
+                    chart.hoverX = mouse.x;
+                    const t = Date.now() - root.spanMs + mouse.x / chart.width * root.spanMs;
+                    const slot = Math.floor(t / root.slotMs) * root.slotMs;
+                    const s = root.history.find((x) => x.t === slot);
+                    const when = Qt.formatTime(new Date(slot), "hh:mm");
+                    chart.hoverText = s ? i18np("%2: 1 person", "%2: %1 people", s.v, when)
+                                        : i18n("%1: no answer", when);
+                }
+                onExited: { chart.hoverX = -1; chart.hoverText = ""; }
+            }
+        }
+
+        RowLayout {
+            Layout.fillWidth: true
+            PlasmaComponents.Label { opacity: 0.6; font: Kirigami.Theme.smallFont; text: i18n("24 h ago") }
+            Item { Layout.fillWidth: true }
+            PlasmaComponents.Label { opacity: 0.6; font: Kirigami.Theme.smallFont; text: i18n("12 h ago") }
+            Item { Layout.fillWidth: true }
+            PlasmaComponents.Label { opacity: 0.6; font: Kirigami.Theme.smallFont; text: i18n("now") }
+        }
+    }
+
     // ---- panel / desktop icon with the count ------------------------------------
     compactRepresentation: MouseArea {
         id: compact
@@ -206,7 +394,7 @@ PlasmoidItem {
 
     // ---- popup with details -----------------------------------------------------
     fullRepresentation: ColumnLayout {
-        Layout.preferredWidth: Kirigami.Units.gridUnit * 16
+        Layout.preferredWidth: Kirigami.Units.gridUnit * (root.showHistory ? 26 : 16)
         Layout.minimumHeight: Kirigami.Units.gridUnit * 8
         spacing: Kirigami.Units.smallSpacing
 
@@ -262,6 +450,11 @@ PlasmoidItem {
         PlasmaComponents.Label {
             opacity: 0.6
             text: root.checkedAt.getTime() > 0 ? i18n("Checked %1", Qt.formatTime(root.checkedAt)) : i18n("Checking…")
+        }
+        HistoryChart {
+            visible: root.showHistory
+            Layout.fillWidth: true
+            Layout.topMargin: Kirigami.Units.smallSpacing
         }
         Item { Layout.fillHeight: true }
         PlasmaComponents.Button {
