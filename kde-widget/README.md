@@ -63,21 +63,23 @@ In the panel, each server's name and count:
 
 ## History (up to a month)
 
-Right-click → **History** (tick it) to show a chart per server in the popup;
-untick it to hide it. It opens on the last 24 hours, newest on the right.
+Right-click → **History** (tick it) to show a chart in the popup; untick it
+to hide it. Both servers share the one chart, side by side, each in its own
+colour (named in the legend above it). It opens on the last 24 hours, newest
+on the right.
 
-- **Scroll** over a chart to zoom, from 1 hour up to 30 days, around the
+- **Scroll** over the chart to zoom, from 1 hour up to 30 days, around the
   point under the mouse.
 - **Drag** (or Shift+scroll) to move back and forth in time.
 - **Double-click** (or **Last 24 h**) to go back to the last 24 hours.
 
 Each bar is the most people connected during its time: 5 minutes when zoomed
 in, widening to 10 minutes, an hour… up to a day as you zoom out. A thin line
-means the server was up with nobody on; a gap means its status page didn't
-answer. Hover a bar for its time and count (all charts show the same moment);
-otherwise each chart shows its peak over the range shown.
+in a server's colour means it was up with nobody on; a gap means its status
+page didn't answer. Hover the chart for each server's count at that time;
+otherwise the legend shows each server's peak over the range shown.
 
-The widget records while it runs (whether or not the charts are shown) and
+The widget records while it runs (whether or not the chart is shown) and
 saves the last 30 days in its settings, so the history survives a Plasma
 restart. A server whose name or address changes starts a new history; the
 24-hour history of the one-server version is carried over to the server with

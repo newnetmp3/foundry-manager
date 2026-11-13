@@ -423,47 +423,76 @@ PlasmoidItem {
         return "rgba(" + Math.round(c.r * 255) + "," + Math.round(c.g * 255) + "," + Math.round(c.b * 255) + "," + a + ")";
     }
 
-    // ---- one server's history chart ------------------------------------------------------
-    // Bars over the shown time range, newest on the right. Each bar is the most
-    // people connected in its time (5 minutes when zoomed in, up to a day when
-    // zoomed out). Wheel: zoom; drag or Shift+wheel: move; double-click: last 24 h.
+    // ---- history chart: every server on one chart ------------------------------------------
+    // Side-by-side bars per time step, one colour per server, newest on the right.
+    // Each bar is the most people connected in its time (5 minutes when zoomed
+    // in, up to a day when zoomed out). Wheel: zoom; drag or Shift+wheel: move;
+    // double-click: last 24 h.
+    function serverColor(i) {
+        const c = [Kirigami.Theme.highlightColor, Kirigami.Theme.neutralTextColor,
+                   Kirigami.Theme.positiveTextColor, Qt.rgba(0.61, 0.35, 0.71, 1),
+                   Qt.rgba(0.91, 0.26, 0.58, 1), Qt.rgba(0, 0.66, 0.66, 1)];
+        return c[i % c.length];
+    }
+    // Wide enough that each server's bar gets at least 3 pixels.
+    function chartBucketMs(width) { return bucketMs(viewSpan, width / Math.max(1, servers.length)); }
+
     component HistoryChart: ColumnLayout {
         id: chartBox
-        property int index: 0
-        spacing: 0
+        spacing: Kirigami.Units.smallSpacing
 
-        RowLayout {
+        // Legend: each server's colour and name, with its peak over the range
+        // shown, or its count at the time under the mouse.
+        Flow {
             Layout.fillWidth: true
+            spacing: Kirigami.Units.largeSpacing
             PlasmaComponents.Label {
-                font.bold: true
-                text: { root.stateRev; return root.srv[chartBox.index] ? root.srv[chartBox.index].name : ""; }
-            }
-            Item { Layout.fillWidth: true }
-            PlasmaComponents.Label {
-                opacity: 0.7
+                visible: root.hoverT >= 0
                 font: Kirigami.Theme.smallFont
+                opacity: 0.7
                 text: {
-                    root.historyRev; root.viewSpan; root.viewEnd; chart.tick;
-                    const s = root.srv[chartBox.index];
-                    if (!s) return "";
-                    const bucket = root.bucketMs(root.viewSpan, chart.width);
-                    if (root.hoverT >= 0) {
-                        const t = root.alignLocal(root.hoverT, bucket);
-                        const v = root.maxBetween(s.hist, t, t + bucket);
-                        const when = root.bucketText(t, bucket);
-                        if (v < 0) return i18n("%1: no answer", when);
-                        return bucket > root.slotMs ? i18np("%2: up to 1 person", "%2: up to %1 people", v, when)
-                                                    : i18np("%2: 1 person", "%2: %1 people", v, when);
+                    if (root.hoverT < 0) return "";
+                    const bucket = root.chartBucketMs(chart.width);
+                    return root.bucketText(root.alignLocal(root.hoverT, bucket), bucket);
+                }
+            }
+            Repeater {
+                model: root.servers.length
+                delegate: Row {
+                    required property int index
+                    spacing: Math.round(Kirigami.Units.smallSpacing * 1.5)
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Kirigami.Units.gridUnit * 0.6
+                        height: width
+                        radius: 2
+                        color: root.serverColor(index)
                     }
-                    const end = root.viewEndNow(), start = end - root.viewSpan;
-                    let best = -1, bestT = 0;
-                    for (let i = 0; i < s.hist.vals.length; i++) {
-                        const t = s.hist.start + i * root.slotMs;
-                        if (t + root.slotMs <= start || t >= end) continue;
-                        if (s.hist.vals[i] > best) { best = s.hist.vals[i]; bestT = t; }
+                    PlasmaComponents.Label {
+                        font: Kirigami.Theme.smallFont
+                        text: {
+                            root.historyRev; root.viewSpan; root.viewEnd; chart.tick; root.stateRev;
+                            const s = root.srv[index];
+                            if (!s) return "";
+                            const bucket = root.chartBucketMs(chart.width);
+                            if (root.hoverT >= 0) {
+                                const t = root.alignLocal(root.hoverT, bucket);
+                                const v = root.maxBetween(s.hist, t, t + bucket);
+                                if (v < 0) return i18n("%1: no answer", s.name);
+                                return bucket > root.slotMs ? i18n("%1: up to %2", s.name, v) : i18n("%1: %2", s.name, v);
+                            }
+                            const end = root.viewEndNow(), start = end - root.viewSpan;
+                            let best = -1, bestT = 0;
+                            for (let i = 0; i < s.hist.vals.length; i++) {
+                                const t = s.hist.start + i * root.slotMs;
+                                if (t + root.slotMs <= start || t >= end) continue;
+                                if (s.hist.vals[i] > best) { best = s.hist.vals[i]; bestT = t; }
+                            }
+                            return best >= 0
+                                ? i18n("%1: peak %2 · %3", s.name, best, Qt.formatDateTime(new Date(bestT), root.viewSpan > root.dayMs ? "ddd d MMM hh:mm" : "hh:mm"))
+                                : i18n("%1: no data", s.name);
+                        }
                     }
-                    return best >= 0 ? i18n("Peak %1 · %2", best, Qt.formatDateTime(new Date(bestT), root.viewSpan > root.dayMs ? "ddd d MMM hh:mm" : "hh:mm"))
-                                     : i18n("No data");
                 }
             }
         }
@@ -471,7 +500,7 @@ PlasmoidItem {
         Canvas {
             id: chart
             Layout.fillWidth: true
-            Layout.preferredHeight: Kirigami.Units.gridUnit * 4
+            Layout.preferredHeight: Kirigami.Units.gridUnit * 7
             property int tick: 0
 
             onWidthChanged: requestPaint()
@@ -482,6 +511,7 @@ PlasmoidItem {
                 function onViewSpanChanged() { chart.requestPaint(); }
                 function onViewEndChanged() { chart.requestPaint(); }
                 function onHoverTChanged() { chart.requestPaint(); }
+                function onSrvChanged() { chart.requestPaint(); }
             }
             // Scroll with the clock while the chart is open.
             Timer {
@@ -494,22 +524,23 @@ PlasmoidItem {
             onPaint: {
                 const ctx = getContext("2d");
                 ctx.reset();
-                const s = root.srv[chartBox.index];
-                if (!s) return;
+                const list = root.srv;
+                const n = list.length;
+                if (!n) return;
                 const w = width, h = height;
                 const top = 12, base = h - 1;
                 const end = root.viewEndNow(), span = root.viewSpan, start = end - span;
-                const bucket = root.bucketMs(span, w);
+                const bucket = root.chartBucketMs(w);
                 const xOf = (t) => (t - start) / span * w;
                 const text = Kirigami.Theme.textColor;
-                const bar = Kirigami.Theme.highlightColor;
 
+                // [{t, v: [people per server, -1 = no answer]}]
                 const buckets = [];
                 let max = 1;
                 for (let t = root.alignLocal(start, bucket); t < end; t += bucket) {
-                    const v = root.maxBetween(s.hist, t, t + bucket);
+                    const v = list.map((s) => root.maxBetween(s.hist, t, t + bucket));
                     buckets.push({ t: t, v: v });
-                    if (v > max) max = v;
+                    for (const x of v) if (x > max) max = x;
                 }
 
                 // Guide lines: the top value and the middle (whole numbers only).
@@ -523,26 +554,34 @@ PlasmoidItem {
                     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
                     ctx.fillText(String(lv), 2, y - 2);
                 }
-                // Time marks (the same as the labels under the charts).
+                // Time marks (the same as the labels under the chart).
                 const step = root.tickMs(span);
                 for (let t = root.alignLocal(start, step) + step; t < end; t += step) {
                     const x = Math.round(xOf(t)) + 0.5;
                     ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, base); ctx.stroke();
                 }
-                // Bars.
-                const bw = bucket / span * w;
+                // Bars: one group per time step, one bar per server in its colour.
+                const groupW = bucket / span * w;
+                const gap = groupW > 4 * n ? 1 : 0;           // space between groups
+                const bw = Math.max(1, (groupW - gap) / n);
                 const hoverB = root.hoverT < 0 ? -1 : root.alignLocal(root.hoverT, bucket);
+                const colors = list.map((s, i) => root.serverColor(i));
                 for (const b of buckets) {
-                    if (b.v < 0) continue;
-                    const x = xOf(b.t);
-                    if (b.v > 0) {
-                        const bh = Math.max(2, (b.v / max) * (base - top));
-                        ctx.fillStyle = root.colorString(bar, b.t === hoverB ? 1 : 0.75);
-                        ctx.fillRect(x, base - bh, Math.max(1, bw - (bw > 3 ? 1 : 0)), bh);
-                    } else {
-                        // Server up, nobody on: a thin line, so it differs from a gap (no answer).
-                        ctx.fillStyle = root.colorString(text, b.t === hoverB ? 0.6 : 0.3);
-                        ctx.fillRect(x, base - 1, bw, 1);
+                    const x0 = xOf(b.t);
+                    const hovered = b.t === hoverB;
+                    for (let i = 0; i < n; i++) {
+                        const v = b.v[i];
+                        if (v < 0) continue;
+                        const x = x0 + i * bw;
+                        if (v > 0) {
+                            const bh = Math.max(2, (v / max) * (base - top));
+                            ctx.fillStyle = root.colorString(colors[i], hovered ? 1 : 0.8);
+                            ctx.fillRect(x, base - bh, Math.max(1, bw), bh);
+                        } else {
+                            // Server up, nobody on: a thin line, so it differs from a gap (no answer).
+                            ctx.fillStyle = root.colorString(colors[i], hovered ? 0.7 : 0.4);
+                            ctx.fillRect(x, base - 2, Math.max(1, bw), 2);
+                        }
                     }
                 }
                 // Hover line.
@@ -559,7 +598,7 @@ PlasmoidItem {
         }
     }
 
-    // Mouse handling shared by the charts and the time axis.
+    // Mouse handling shared by the chart and the time axis.
     component ChartMouse: MouseArea {
         id: ma
         hoverEnabled: true
@@ -590,7 +629,7 @@ PlasmoidItem {
         }
     }
 
-    // ---- all servers' charts, with the shown range and a time axis ----------------------
+    // ---- the history chart, with the shown range and a time axis ----------------------
     component HistoryCharts: ColumnLayout {
         spacing: Kirigami.Units.smallSpacing
 
@@ -610,13 +649,7 @@ PlasmoidItem {
             }
         }
 
-        Repeater {
-            model: root.servers.length
-            delegate: HistoryChart {
-                required property int index
-                Layout.fillWidth: true
-            }
-        }
+        HistoryChart { Layout.fillWidth: true }
 
         Canvas {
             id: axis
