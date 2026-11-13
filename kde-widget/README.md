@@ -38,11 +38,12 @@ Then restart Plasma so it loads the new version: `systemctl --user restart plasm
 
 Right-click the widget → **Configure Foundry VTT Players…**
 
-- **Servers**: one per line, a name and then its status page:
+- **Servers**: one per line, a name, its status page and (optionally) its
+  pm2 log:
 
   ```
-  komo http://localhost:30000/api/status
-  nier http://localhost:30001/api/status
+  komo http://localhost:30000/api/status /home/komovtt/.pm2/logs/komovtt-out.log
+  nier http://localhost:30001/api/status /home/komovtt/.pm2/logs/Nier-out.log
   ```
 
   Those are the defaults; set the ports to the ones in the **Port** column of
@@ -52,6 +53,37 @@ Right-click the widget → **Configure Foundry VTT Players…**
 - **Fallback**: if a status page has no count, count connections to that
   server's port with `ss` (one address = one person). Only for servers on
   this computer.
+
+## Who is connected
+
+With a server's pm2 log set, the popup shows who is on (**On: Nier, …**), the
+tooltip lists them, and hovering the history chart names who was on at that
+time. Foundry writes these lines to the log:
+
+```
+User authentication successful for user Nier        ← name
+Vended World data to User [ORwITUl8eeqkicFt]        ← joined (the user's id)
+Logged user ORwITUl8eeqkicFt out of active World    ← left
+```
+
+The widget reads only those lines. If the status page counts fewer people
+than the log says are on (someone dropped without a leave line, or Foundry
+restarted), the longest-connected are taken off. Visits are kept for 30 days,
+like the counts.
+
+Your desktop user must be able to read the log. If Foundry runs as another
+user (here `komovtt`), add yourself to its group and open its home to the
+group, then log out and back in:
+
+```bash
+sudo usermod -aG komovtt "$USER"
+sudo chmod 750 /home/komovtt
+sudo find /home/komovtt -mindepth 1 -maxdepth 1 ! -name .ssh ! -name .gnupg -exec chmod -R g+rwX {} +
+sudo find /home/komovtt -mindepth 1 -maxdepth 1 ! -name .ssh ! -name .gnupg -type d -exec setfacl -R -d -m g:komovtt:rwX {} +
+```
+
+(`.ssh` and `.gnupg` stay private: SSH refuses keys in group-writable
+folders.) Until then the popup says **Can't read …**.
 
 ## What it shows
 

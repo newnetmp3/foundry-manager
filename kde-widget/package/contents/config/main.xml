@@ -5,9 +5,9 @@
   <kcfgfile name=""/>
   <group name="General">
     <entry name="servers" type="String">
-      <label>Servers to watch, one per line: a name, then its status page (or just its address)</label>
-      <default>komo http://localhost:30000/api/status
-nier http://localhost:30001/api/status</default>
+      <label>Servers to watch, one per line: a name, its status page (or just its address), and optionally its pm2 log</label>
+      <default>komo http://localhost:30000/api/status /home/komovtt/.pm2/logs/komovtt-out.log
+nier http://localhost:30001/api/status /home/komovtt/.pm2/logs/Nier-out.log</default>
     </entry>
     <entry name="interval" type="Int">
       <label>Seconds between checks</label>

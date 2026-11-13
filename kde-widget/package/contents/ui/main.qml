@@ -9,6 +9,11 @@
 // server's page has no count, the widget can count connections to Foundry's
 // port with `ss` instead (only for servers on this computer; behind a reverse
 // proxy that counts the proxy, not players).
+//
+// Who is connected comes from each server's pm2 log, where Foundry writes
+//   "User authentication successful for user Nier", then
+//   "Vended World data to User [ORwITUl8eeqkicFt]" when they join, and
+//   "Logged user ORwITUl8eeqkicFt out of active World" when they leave.
 import QtQuick
 import QtQuick.Layouts
 import org.kde.plasma.plasmoid
@@ -21,10 +26,11 @@ PlasmoidItem {
     id: root
 
     // ---- servers ------------------------------------------------------------------
-    // Settings hold one server per line: "name address", e.g.
-    //   komo http://localhost:30000/api/status
+    // Settings hold one server per line: "name address [pm2 log]", e.g.
+    //   komo http://localhost:30000/api/status /home/komovtt/.pm2/logs/komovtt-out.log
     //   nier https://nier.example.com
     // "/api/status" is added when missing, "http://" when there's no scheme.
+    // The log (optional) is where the names of the people connected come from.
     readonly property var servers: parseServers(Plasmoid.configuration.servers)
 
     function parseServers(text) {
@@ -34,12 +40,14 @@ PlasmoidItem {
             const line = raw.trim();
             if (!line || line.startsWith("#")) continue;
             const parts = line.split(/\s+/);
+            let log = "";
+            if (parts.length > 1 && /^[~\/]/.test(parts[parts.length - 1])) log = parts.pop();
             let url = parts.length > 1 ? parts[parts.length - 1] : parts[0];
             if (!/^https?:\/\//i.test(url)) url = "http://" + url;
             if (!/\/api\/status\/?$/.test(url)) url = url.replace(/\/+$/, "") + "/api/status";
             let name = parts.length > 1 ? parts.slice(0, -1).join(" ") : hostOf(url);
             if (names[name]) name += " " + (++names[name]); else names[name] = 1;
-            out.push({ name: name, url: url, key: name + "|" + url });
+            out.push({ name: name, url: url, key: name + "|" + url, log: /^[\w.\/~+@-]+$/.test(log) ? log : "" });
         }
         return out;
     }
@@ -60,7 +68,8 @@ PlasmoidItem {
     // ---- state, one entry per server (same order as `servers`) --------------------
     // {name, key, url, users (-1 unknown), reachable, worldActive, world, version,
     //  system, howCounted ("status page"/"connections"), problem, checkedAt (ms),
-    //  hist: {start: first slot (ms), vals: [people per slot, -1 = no answer]}}
+    //  hist: {start: first slot (ms), vals: [people per slot, -1 = no answer]},
+    //  log, logProblem, sessions: [{n: name, id: Foundry user id, s: joined (ms), e: left (ms, 0 = still on)}]}
     property var srv: []
     property int stateRev: 0            // bumped on every change (re-evaluates bindings)
 
@@ -79,7 +88,8 @@ PlasmoidItem {
         for (const s of servers) {
             const h = saved[s.key];
             list.push({
-                name: s.name, key: s.key, url: s.url,
+                name: s.name, key: s.key, url: s.url, log: s.log, logProblem: "",
+                sessions: h && Array.isArray(h.p) ? h.p.slice() : [],
                 users: -1, reachable: false, worldActive: false, world: "", version: "", system: "",
                 howCounted: "", problem: "", checkedAt: 0,
                 hist: h && Array.isArray(h.v) ? { start: Number(h.s) || 0, vals: h.v.slice() } : { start: 0, vals: [] }
@@ -132,7 +142,8 @@ PlasmoidItem {
     function flushHistory() {
         saveTimer.stop();
         const out = {};
-        for (const s of srv) if (s.hist.vals.length) out[s.key] = { s: s.hist.start, v: s.hist.vals };
+        for (const s of srv)
+            if (s.hist.vals.length || s.sessions.length) out[s.key] = { s: s.hist.start, v: s.hist.vals, p: s.sessions };
         Plasmoid.configuration.historyData = JSON.stringify(out);
     }
     // Settings are written at most every 30 seconds.
@@ -255,7 +266,8 @@ PlasmoidItem {
         if (!s.worldActive) return i18n("Server up, no world running");
         const who = s.users < 0 ? i18n("players unknown")
             : i18np("1 person connected", "%1 people connected", s.users);
-        return who + " · " + prettyWorld(s.world)
+        const names = onlineNames(s);
+        return who + (names.length ? " (" + names.join(", ") + ")" : "") + " · " + prettyWorld(s.world)
             + (s.howCounted === "connections" ? " " + i18n("(counted from connections)") : "");
     }
 
@@ -268,7 +280,7 @@ PlasmoidItem {
     preferredRepresentation: compactRepresentation
 
     // ---- polling --------------------------------------------------------------------
-    function pollAll() { for (const s of srv) poll(s); }
+    function pollAll() { for (const s of srv) { poll(s); readLog(s); } }
     function poll(st) {
         const xhr = new XMLHttpRequest();
         xhr.timeout = 8000;
@@ -301,10 +313,12 @@ PlasmoidItem {
                 st.users = d.users;
                 st.howCounted = "status page";
                 root.record(st, st.worldActive ? d.users : 0);
+                root.reconcile(st, st.worldActive ? d.users : 0);
             } else if (!st.worldActive) {
                 st.users = 0;
                 st.howCounted = "status page";
                 root.record(st, 0);
+                root.reconcile(st, 0);
             } else {
                 st.users = -1;
                 countConnections(st);
@@ -317,24 +331,12 @@ PlasmoidItem {
 
     // Fallback: established TCP connections to Foundry's port, by remote address
     // (a browser opens several connections; one address = one person).
-    property var ssWaiting: ({})        // command → server state
     function countConnections(st) {
         if (!Plasmoid.configuration.useSocketFallback) return;
         const port = localPort(st.url);
         if (!port) return;
-        const cmd = "ss -Htn state established '( sport = :" + port + " )'";
-        ssWaiting[cmd] = st;
-        exec.connectSource(cmd);
-    }
-    P5Support.DataSource {
-        id: exec
-        engine: "executable"
-        connectedSources: []
-        onNewData: (source, data) => {
-            disconnectSource(source);
-            const st = root.ssWaiting[source];
-            delete root.ssWaiting[source];
-            if (!st || root.srv.indexOf(st) < 0 || data["exit code"] !== 0) return;
+        run("ss -Htn state established '( sport = :" + port + " )'", (data) => {
+            if (root.srv.indexOf(st) < 0 || data["exit code"] !== 0) return;
             const peers = new Set();
             for (const line of String(data.stdout || "").split("\n")) {
                 const cols = line.trim().split(/\s+/);
@@ -348,7 +350,121 @@ PlasmoidItem {
                 root.record(st, peers.size);
                 root.stateRev++;
             }
+        });
+    }
+
+    // Run a command; `done` gets its {stdout, stderr, "exit code"}.
+    property var execWaiting: ({})      // command → done
+    function run(cmd, done) {
+        execWaiting[cmd] = done;
+        exec.connectSource(cmd);
+    }
+    P5Support.DataSource {
+        id: exec
+        engine: "executable"
+        connectedSources: []
+        onNewData: (source, data) => {
+            disconnectSource(source);
+            const done = root.execWaiting[source];
+            delete root.execWaiting[source];
+            if (done) done(data);
         }
+    }
+
+    // ---- who is connected, from the pm2 log ---------------------------------------------
+    // Only the join/leave lines are read (the last 3000 of them: weeks of play).
+    function readLog(st) {
+        if (!st.log) return;
+        const q = "'" + st.log.replace(/^~\//, "") + "'";
+        const path = st.log.startsWith("~/") ? "\"$HOME\"/" + q : q;
+        run("if [ -r " + path + " ]; then grep -aE 'User authentication successful for user|Vended World data to User|out of active World' "
+            + path + " | tail -n 3000; else echo __UNREADABLE__; fi", (data) => {
+            if (root.srv.indexOf(st) < 0) return;
+            const out = String(data.stdout || "");
+            const problem = out.startsWith("__UNREADABLE__") ? i18n("Can't read %1", st.log) : "";
+            if (problem !== st.logProblem) { st.logProblem = problem; root.stateRev++; }
+            if (!problem) applyLog(st, out);
+        });
+    }
+    function logTime(line) {
+        const m = line.match(/(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d)/);
+        return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime() : 0;
+    }
+    function applyLog(st, text) {
+        const known = {};                       // id → name, from earlier sessions
+        for (const p of st.sessions) known[p.id] = p.n;
+        const open = {};                        // id → session, while reading
+        const found = [];
+        let pendingName = "";
+        for (const line of text.split("\n")) {
+            const t = logTime(line);
+            if (!t) continue;
+            let m;
+            if ((m = line.match(/User authentication successful for user (.+?)\s*(?:"|$)/))) {
+                pendingName = m[1].trim();
+            } else if ((m = line.match(/Vended World data to User \[(\w+)\]/))) {
+                const id = m[1];
+                const name = pendingName || known[id] || id;
+                known[id] = name;
+                pendingName = "";
+                if (open[id]) continue;             // a reload: still the same visit
+                open[id] = { n: name, id: id, s: t, e: 0 };
+                found.push(open[id]);
+            } else if ((m = line.match(/Logged user (\w+) out of active World/))) {
+                if (open[m[1]]) { open[m[1]].e = t; delete open[m[1]]; }
+            }
+        }
+        // Merge with what we have. A visit we closed ourselves (the status page
+        // said fewer people were on) stays closed.
+        const byKey = {};
+        for (const p of st.sessions) byKey[p.id + "@" + p.s] = p;
+        let changed = false;
+        for (const f of found) {
+            const p = byKey[f.id + "@" + f.s];
+            if (!p) { st.sessions.push(f); changed = true; }
+            else if (f.e && p.e !== f.e) { p.e = f.e; changed = true; }
+            else if (p.n !== f.n && f.n !== f.id) { p.n = f.n; changed = true; }
+        }
+        const oldest = Date.now() - keepMs;
+        const kept = st.sessions.filter((p) => !p.e || p.e > oldest);
+        if (kept.length !== st.sessions.length) { st.sessions = kept; changed = true; }
+        if (changed) {
+            st.sessions.sort((a, b) => a.s - b.s);
+            stateRev++;
+            historyRev++;
+            if (!saveTimer.running) saveTimer.start();
+        }
+    }
+    // The status page has the real count: when fewer people are on than the log
+    // says (someone dropped without a leave line, or Foundry restarted), close the
+    // longest-running visits. Visits that began in the last minute are left alone,
+    // since the log may be newer than the status page.
+    function reconcile(st, count) {
+        const now = Date.now();
+        const open = st.sessions.filter((p) => !p.e);
+        let extra = open.length - count;
+        if (extra <= 0) return;
+        let changed = false;
+        for (const p of open) {
+            if (extra <= 0) break;
+            if (p.s > now - 60000) continue;
+            p.e = now;
+            extra--;
+            changed = true;
+        }
+        if (changed) {
+            historyRev++;
+            if (!saveTimer.running) saveTimer.start();
+        }
+    }
+    function onlineNames(s) {
+        if (!s || !s.reachable || !s.worldActive) return [];
+        return [...new Set(s.sessions.filter((p) => !p.e).map((p) => p.n))];
+    }
+    // Who was on at some point in [t0, t1).
+    function namesBetween(s, t0, t1) {
+        const now = Date.now();
+        return [...new Set(s.sessions.filter((p) => p.s < t1 && (p.e || now) > t0).map((p) => p.n))];
     }
 
     Timer {
@@ -479,7 +595,9 @@ PlasmoidItem {
                                 const t = root.alignLocal(root.hoverT, bucket);
                                 const v = root.maxBetween(s.hist, t, t + bucket);
                                 if (v < 0) return i18n("%1: no answer", s.name);
-                                return bucket > root.slotMs ? i18n("%1: up to %2", s.name, v) : i18n("%1: %2", s.name, v);
+                                const who = root.namesBetween(s, t, t + bucket);
+                                return (bucket > root.slotMs ? i18n("%1: up to %2", s.name, v) : i18n("%1: %2", s.name, v))
+                                    + (who.length ? " (" + who.join(", ") + ")" : "");
                             }
                             const end = root.viewEndNow(), start = end - root.viewSpan;
                             let best = -1, bestT = 0;
@@ -800,6 +918,16 @@ PlasmoidItem {
                             return (s.users === 1 ? i18n("person connected") : i18n("people connected"))
                                 + " · " + root.prettyWorld(s.world);
                         }
+                    }
+                    PlasmaComponents.Label {
+                        readonly property var names: root.onlineNames(serverRow.st)
+                        visible: !!serverRow.st && (names.length > 0 || serverRow.st.logProblem !== "")
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        color: names.length ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.neutralTextColor
+                        text: !serverRow.st ? ""
+                            : names.length ? i18n("On: %1", names.join(", "))
+                            : serverRow.st.logProblem
                     }
                     PlasmaComponents.Label {
                         visible: !!serverRow.st && serverRow.st.reachable
