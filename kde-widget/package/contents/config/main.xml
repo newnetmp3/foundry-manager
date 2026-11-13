@@ -4,9 +4,10 @@
       xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0 http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
   <kcfgfile name=""/>
   <group name="General">
-    <entry name="statusUrl" type="String">
-      <label>Foundry's status page (the server address followed by /api/status)</label>
-      <default>http://localhost:30000/api/status</default>
+    <entry name="servers" type="String">
+      <label>Servers to watch, one per line: a name, then its status page (or just its address)</label>
+      <default>komo http://localhost:30000/api/status
+nier http://localhost:30001/api/status</default>
     </entry>
     <entry name="interval" type="Int">
       <label>Seconds between checks</label>
@@ -15,21 +16,19 @@
       <max>3600</max>
     </entry>
     <entry name="useSocketFallback" type="Bool">
-      <label>If the status page doesn't give a count, count connections to the port with ss</label>
+      <label>If a status page doesn't give a count, count connections to that server's port with ss</label>
       <default>true</default>
     </entry>
-    <entry name="port" type="Int">
-      <label>Foundry's port (for counting connections)</label>
-      <default>30000</default>
-      <min>1</min>
-      <max>65535</max>
-    </entry>
     <entry name="showHistory" type="Bool">
-      <label>Show the 24-hour history chart in the popup</label>
+      <label>Show the history charts in the popup</label>
       <default>false</default>
     </entry>
+    <entry name="historyData" type="String">
+      <label>Saved player counts for the history charts, up to 30 days per server (written by the widget)</label>
+      <default></default>
+    </entry>
     <entry name="history" type="String">
-      <label>Saved player counts for the history chart (written by the widget)</label>
+      <label>The single-server history of version 1.2 (read once, then cleared)</label>
       <default></default>
     </entry>
   </group>

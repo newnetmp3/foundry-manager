@@ -2,12 +2,12 @@
     "KPlugin": {
         "Authors": [{ "Name": "newnetmp3" }],
         "Category": "System Information",
-        "Description": "How many people are connected to your Foundry VTT server",
+        "Description": "How many people are connected to your Foundry VTT servers",
         "Icon": "applications-games",
         "Id": "io.github.newnetmp3.foundryplayers",
         "License": "MIT",
         "Name": "Foundry VTT Players",
-        "Version": "1.2",
+        "Version": "2.0",
         "Website": "https://github.com/newnetmp3/foundry-manager/tree/main/kde-widget"
     },
     "KPackageStructure": "Plasma/Applet",
