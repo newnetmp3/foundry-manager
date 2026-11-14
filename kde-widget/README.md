@@ -96,8 +96,8 @@ In the panel, each server's name and count:
 ## History (up to a month)
 
 Right-click → **History** (tick it) to show a chart in the popup; untick it
-to hide it. Both servers share the one chart, side by side, each in its own
-colour (named in the legend above it). It opens on the last 24 hours, newest
+to hide it. Both servers share the one chart: each bar stacks the servers' people,
+each in its own colour (named in the legend above it). It opens on the last 24 hours, newest
 on the right.
 
 - **Scroll** over the chart to zoom, from 1 hour up to 30 days, around the
@@ -107,8 +107,8 @@ on the right.
 
 Each bar is the most people connected during its time: 5 minutes when zoomed
 in, widening to 10 minutes, an hour… up to a day as you zoom out. A thin line
-in a server's colour means it was up with nobody on; a gap means its status
-page didn't answer. Hover the chart for each server's count at that time;
+means the servers were up with nobody on; a gap means no status page
+answered. Hover the chart for each server's count at that time;
 otherwise the legend shows each server's peak over the range shown.
 
 The widget records while it runs (whether or not the chart is shown) and

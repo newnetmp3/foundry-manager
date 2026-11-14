@@ -540,7 +540,8 @@ PlasmoidItem {
     }
 
     // ---- history chart: every server on one chart ------------------------------------------
-    // Side-by-side bars per time step, one colour per server, newest on the right.
+    // One bar per time step, newest on the right, with each server's people
+    // stacked in its own colour (the first server at the bottom).
     // Each bar is the most people connected in its time (5 minutes when zoomed
     // in, up to a day when zoomed out). Wheel: zoom; drag or Shift+wheel: move;
     // double-click: last 24 h.
@@ -550,8 +551,7 @@ PlasmoidItem {
                    Qt.rgba(0.91, 0.26, 0.58, 1), Qt.rgba(0, 0.66, 0.66, 1)];
         return c[i % c.length];
     }
-    // Wide enough that each server's bar gets at least 3 pixels.
-    function chartBucketMs(width) { return bucketMs(viewSpan, width / Math.max(1, servers.length)); }
+    function chartBucketMs(width) { return bucketMs(viewSpan, width); }
 
     component HistoryChart: ColumnLayout {
         id: chartBox
@@ -658,7 +658,9 @@ PlasmoidItem {
                 for (let t = root.alignLocal(start, bucket); t < end; t += bucket) {
                     const v = list.map((s) => root.maxBetween(s.hist, t, t + bucket));
                     buckets.push({ t: t, v: v });
-                    for (const x of v) if (x > max) max = x;
+                    let sum = 0;
+                    for (const x of v) if (x > 0) sum += x;
+                    if (sum > max) max = sum;
                 }
 
                 // Guide lines: the top value and the middle (whole numbers only).
@@ -678,28 +680,30 @@ PlasmoidItem {
                     const x = Math.round(xOf(t)) + 0.5;
                     ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, base); ctx.stroke();
                 }
-                // Bars: one group per time step, one bar per server in its colour.
-                const groupW = bucket / span * w;
-                const gap = groupW > 4 * n ? 1 : 0;           // space between groups
-                const bw = Math.max(1, (groupW - gap) / n);
+                // Bars: one per time step, each server's people stacked in its colour.
+                const bw = bucket / span * w;
+                const barW = Math.max(1, bw - (bw > 3 ? 1 : 0));
+                const unit = (base - top) / max;
                 const hoverB = root.hoverT < 0 ? -1 : root.alignLocal(root.hoverT, bucket);
                 const colors = list.map((s, i) => root.serverColor(i));
                 for (const b of buckets) {
-                    const x0 = xOf(b.t);
+                    const x = xOf(b.t);
                     const hovered = b.t === hoverB;
+                    let y = base, answered = false;
                     for (let i = 0; i < n; i++) {
                         const v = b.v[i];
                         if (v < 0) continue;
-                        const x = x0 + i * bw;
-                        if (v > 0) {
-                            const bh = Math.max(2, (v / max) * (base - top));
-                            ctx.fillStyle = root.colorString(colors[i], hovered ? 1 : 0.8);
-                            ctx.fillRect(x, base - bh, Math.max(1, bw), bh);
-                        } else {
-                            // Server up, nobody on: a thin line, so it differs from a gap (no answer).
-                            ctx.fillStyle = root.colorString(colors[i], hovered ? 0.7 : 0.4);
-                            ctx.fillRect(x, base - 2, Math.max(1, bw), 2);
-                        }
+                        answered = true;
+                        if (v === 0) continue;
+                        const bh = Math.max(2, v * unit);
+                        ctx.fillStyle = root.colorString(colors[i], hovered ? 1 : 0.8);
+                        ctx.fillRect(x, y - bh, barW, bh);
+                        y -= bh;
+                    }
+                    if (answered && y === base) {
+                        // Servers up, nobody on: a thin line, so it differs from a gap (no answer).
+                        ctx.fillStyle = root.colorString(text, hovered ? 0.6 : 0.3);
+                        ctx.fillRect(x, base - 1, bw, 1);
                     }
                 }
                 // Hover line.
