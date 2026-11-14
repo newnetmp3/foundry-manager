@@ -866,8 +866,12 @@ PlasmoidItem {
 
     // ---- popup with details -------------------------------------------------------------
     fullRepresentation: ColumnLayout {
+        id: popup
         Layout.preferredWidth: Kirigami.Units.gridUnit * (root.showHistory ? 30 : 20)
-        Layout.minimumHeight: Kirigami.Units.gridUnit * 8
+        Layout.minimumWidth: Kirigami.Units.gridUnit * (root.showHistory ? 24 : 16)
+        // Ask for the height of everything in it, so the bottom row is never cut off.
+        Layout.minimumHeight: Math.max(Kirigami.Units.gridUnit * 8, implicitHeight)
+        Layout.preferredHeight: Layout.minimumHeight
         spacing: Kirigami.Units.smallSpacing
 
         Kirigami.Heading {
