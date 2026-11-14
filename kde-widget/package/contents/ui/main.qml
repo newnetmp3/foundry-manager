@@ -681,13 +681,13 @@ PlasmoidItem {
                     ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, base); ctx.stroke();
                 }
                 // Bars: one per time step, each server's people stacked in its colour.
-                const bw = bucket / span * w;
-                const barW = Math.max(1, bw - (bw > 3 ? 1 : 0));
+                // Edges on whole pixels, so neighbouring bars meet with no seam.
                 const unit = (base - top) / max;
                 const hoverB = root.hoverT < 0 ? -1 : root.alignLocal(root.hoverT, bucket);
                 const colors = list.map((s, i) => root.serverColor(i));
                 for (const b of buckets) {
-                    const x = xOf(b.t);
+                    const x = Math.round(xOf(b.t));
+                    const barW = Math.max(1, Math.round(xOf(b.t + bucket)) - x);
                     const hovered = b.t === hoverB;
                     let y = base, answered = false;
                     for (let i = 0; i < n; i++) {
@@ -695,7 +695,7 @@ PlasmoidItem {
                         if (v < 0) continue;
                         answered = true;
                         if (v === 0) continue;
-                        const bh = Math.max(2, v * unit);
+                        const bh = Math.max(2, Math.round(v * unit));
                         ctx.fillStyle = root.colorString(colors[i], hovered ? 1 : 0.8);
                         ctx.fillRect(x, y - bh, barW, bh);
                         y -= bh;
@@ -703,7 +703,7 @@ PlasmoidItem {
                     if (answered && y === base) {
                         // Servers up, nobody on: a thin line, so it differs from a gap (no answer).
                         ctx.fillStyle = root.colorString(text, hovered ? 0.6 : 0.3);
-                        ctx.fillRect(x, base - 1, bw, 1);
+                        ctx.fillRect(x, base - 1, barW, 1);
                     }
                 }
                 // Hover line.
