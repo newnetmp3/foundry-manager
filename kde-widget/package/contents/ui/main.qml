@@ -888,7 +888,10 @@ PlasmoidItem {
             delegate: RowLayout {
                 id: serverRow
                 required property int index
-                readonly property var st: { root.stateRev; return root.srv[index] || null; }
+                // A fresh copy on every change: the same object again wouldn't count as a
+                // change, and this row's text would never update after it first drew
+                // (a server whose first check failed stayed "Can't reach the server").
+                readonly property var st: { root.stateRev; const s = root.srv[index]; return s ? Object.assign({}, s) : null; }
                 Layout.fillWidth: true
                 spacing: Kirigami.Units.largeSpacing
 
